@@ -162,6 +162,19 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
     # ---- Synchronous (non-TBO) path ----
 
+    @staticmethod
+    def _resolve_launch_config(token_count_hint: int) -> tuple[int, int]:
+        context = get_forward_context().context
+        # vLLM's profile/dummy run can invoke the MoE path before ATOM's
+        # forward context is populated. Fall back to a simple token-count
+        # heuristic so MORI warmup still uses a stable launch config.
+        is_prefill = (
+            context.is_prefill if context is not None else token_count_hint > 1
+        )
+        if is_prefill:
+            return 128, 16
+        return 64, 4
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -224,8 +237,14 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
+<<<<<<< HEAD
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
+=======
+        # weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> None:
+        block_num, warp_per_block = self._resolve_launch_config(output.shape[0])
+>>>>>>> 439f9eb ([atom-vllm][DP+EP] enable DP+EP for atom-vllm path)
 
         block_num, warp_per_block = self._get_dispatch_config()
 
