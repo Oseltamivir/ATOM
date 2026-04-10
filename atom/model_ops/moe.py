@@ -402,6 +402,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 tbo_mori_ops=tbo_mori_ops,
                 low_latency=low_latency,
             )
+            print('[zejun] FusedMoEMethodBase prepare_finalize = ', prepare_finalize, flush=True)
+            
 
         return prepare_finalize
 
