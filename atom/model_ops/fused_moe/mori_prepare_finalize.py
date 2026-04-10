@@ -237,14 +237,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
-<<<<<<< HEAD
     ) -> torch.Tensor:
         num_token = topk_ids.shape[0]
-=======
-        # weight_and_reduce_impl: mk.TopKWeightAndReduce,
-    ) -> None:
-        block_num, warp_per_block = self._resolve_launch_config(output.shape[0])
->>>>>>> 439f9eb ([atom-vllm][DP+EP] enable DP+EP for atom-vllm path)
 
         block_num, warp_per_block = self._get_dispatch_config()
 
