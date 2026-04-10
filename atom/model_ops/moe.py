@@ -299,12 +299,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # assert not moe.use_flashinfer_cutlass_kernels, "Must be created in modelopt.py"
         if moe.use_mori_kernels:
             assert quant_config is not None
-            atom_config = get_current_atom_config()
-            # Note: We may want to use FP8 dispatch just to reduce
-            # data movement and symmetric heap pressure.
-            use_fp8_dispatch = (
-                quant_config.is_per_act_token or quant_config.is_block_quantized
-            )
             # For PTPC (per token per channel) quant, the scale dim for each token is 1
             # For 1x128 quant, the scale dim for each token is hidden_dim // 128
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
@@ -312,6 +306,16 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # Check if quant_dtype is an FP8 type
             from aiter import QuantType
 
+            fp8_dtypes = (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+                torch.float8_e5m2,
+                torch.float8_e5m2fnuz,
+            )
+            is_fp8 = quant_config.quant_dtype in fp8_dtypes
+            # For FP8: enable FP8 dispatch in Mori (quantize before communication)
+            # Note: per_Tensor quant doesn't support num_local_tokens, so we use per_Token
+            use_fp8_dispatch = is_fp8
             quant_type = None
             if use_fp8_dispatch:
                 if quant_config.is_block_quantized:
@@ -352,7 +356,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
-                gpu_per_node=min(8, all2all_manager.world_size),
+                gpu_per_node=moe.moe_parallel_config.local_ep_size,
             )
             from atom.utils.tbo.ubatching import tbo_enabled
             from atom.config import get_current_atom_config
