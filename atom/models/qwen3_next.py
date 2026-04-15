@@ -209,6 +209,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
