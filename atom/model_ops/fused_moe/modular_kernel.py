@@ -314,7 +314,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
-
         (
             dispatch_a1,
             dispatch_scale,
@@ -357,7 +356,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         else:
             dp_size = get_dp_group().world_size
             topk = topk_ids.shape[1]
-            # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay of native ATOM decode execution).
+            # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
             total_valid_tokens = context.graph_bs * topk * dp_size
             if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
                 dispatch_a1 = dispatch_a1[:total_valid_tokens]
