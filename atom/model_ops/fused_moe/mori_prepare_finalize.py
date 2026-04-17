@@ -155,17 +155,15 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         return tbo_active()
 
-    def _get_dispatch_config(
-        self, num_tokens: int | None = None
-    ) -> tuple[int, int]:
+    def _get_dispatch_config(self, num_tokens: int | None = None) -> tuple[int, int]:
         """Return (block_num, warp_per_block) based on runtime mode."""
         if is_vllm():
             # vLLM does not expose a stable prefill/decode flag here, so use a
             # token-count threshold to keep MORI warmup and runtime selection
             # deterministic in atom-vllm mode
-            assert num_tokens is not None, (
-                "num_tokens is required to choose MORI launch config in vLLM mode."
-            )
+            assert (
+                num_tokens is not None
+            ), "num_tokens is required to choose MORI launch config in vLLM mode."
             if num_tokens >= VLLM_MORI_LAUNCH_CONFIG_TOKEN_THRESHOLD:
                 return 128, 16
             return 64, 4

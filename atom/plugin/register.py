@@ -69,9 +69,9 @@ def init_aiter_dist(config: Config) -> None:
     Initialize aiter dist for using aiter custom collective op.
 
     In vLLM plugin mode, tries to reuse vLLM's TP group and inject aiter's ca_comm
-    first (single IPC init, avoids 2x reduce slowdown). For OOT DP+EP, skip the
+    first (single IPC init, avoids 2x reduce slowdown). For DP+EP, skip the
     reuse fast path and let aiter initialize its own TP/PP/DP/EP groups so EP and
-    all2all ownership stays within the OOT stack. Falls back to init_dist_env if
+    all2all ownership stays within the ATOM+vLLM stack. Falls back to init_dist_env if
     reuse fails.
     """
     logger.info(
