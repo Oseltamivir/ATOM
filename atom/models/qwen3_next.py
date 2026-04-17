@@ -253,16 +253,15 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_routed_experts + n_shared_experts)
+        # router_logits: (num_tokens, n_experts + 1)
         logits = self.gate(hidden_states)
         if not is_rocm_aiter_fusion_shared_expert_enabled():
-            routed_logits = logits[:, : self.n_routed_experts]
+            router_logits = logits[:, : self.n_routed_experts]
         else:
-            routed_logits = logits
+            router_logits = logits
         routed_output = self.experts(
-            hidden_states=hidden_states, router_logits=routed_logits
+            hidden_states=hidden_states, router_logits=router_logits
         )
-
         if not is_rocm_aiter_fusion_shared_expert_enabled():
             shared_output = self.shared_expert(hidden_states)
             # Apply shared expert gate: the merged gate output contains
