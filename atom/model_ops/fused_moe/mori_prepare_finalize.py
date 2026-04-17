@@ -162,7 +162,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if is_vllm():
             # vLLM does not expose a stable prefill/decode flag here, so use a
             # token-count threshold to keep MORI warmup and runtime selection
-            # deterministic in OOT mode
+            # deterministic in atom-vllm mode
             assert num_tokens is not None, (
                 "num_tokens is required to choose MORI launch config in vLLM mode."
             )

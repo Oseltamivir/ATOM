@@ -104,7 +104,7 @@ class FusedMoEParallelConfig:
         # Otherwise, use pure DP for MoE.
         enable_dp_attention = parallel_config.enable_dp_attention
 
-        # for vLLM-ATOM mode, when ep is enabled, the ep rank needs to
+        # for vllm mode, when ep is enabled, the ep rank needs to
         # be calculated in DP * TP flatten group space
         flatten_tp_across_dp_for_moe = enable_dp_attention or (
             is_vllm() and parallel_config.enable_expert_parallel
@@ -333,7 +333,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             # mori_dtype = torch.bfloat16
 
             if is_vllm():
-                # for vLLM-ATOM, use max num batched token here
                 max_num_tokens_per_dp_rank = moe.max_num_tokens
             else:
                 max_num_tokens_per_dp_rank = 16384

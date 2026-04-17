@@ -209,8 +209,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        # self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
-
         if (
             config.shared_expert_intermediate_size > 0
             and not is_rocm_aiter_fusion_shared_expert_enabled()
@@ -258,30 +256,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_routed_experts + n_shared_experts)
         logits = self.gate(hidden_states)
         if not is_rocm_aiter_fusion_shared_expert_enabled():
-            # In the non-fusion path the merged gate carries both routed and
-            # shared-expert scores, so route using only the routed slice and
-            # apply the shared gate locally.
             routed_logits = logits[:, : self.n_routed_experts]
-            routed_output = self.experts(
-                hidden_states=hidden_states, router_logits=routed_logits
-            )
-            if self.shared_expert is None:
-                assert not self.n_shared_experts, (
-                    "Qwen3Next non-fusion shared-expert path requires a "
-                    "standalone shared_expert module when shared experts exist."
-                )
-                final_hidden_states = routed_output
-            else:
-                shared_gate_logits = logits[:, self.n_routed_experts :]
-                shared_output = self.shared_expert(hidden_states)
-                shared_output = torch.sigmoid(shared_gate_logits) * shared_output
-                final_hidden_states = shared_output + routed_output
         else:
-            # In the fusion path FusedMoE consumes the merged routed/shared
-            # logits directly and applies shared-expert gating internally.
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, router_logits=logits
-            )
+            routed_logits = logits
+        routed_output = self.experts(
+            hidden_states=hidden_states, router_logits=routed_logits
+        )
+
+        if not is_rocm_aiter_fusion_shared_expert_enabled():
+            shared_output = self.shared_expert(hidden_states)
+            # Apply shared expert gate: the merged gate output contains
+            # [routed_logits, shared_expert_gate_logits], extract the tail
+            shared_gate_logits = logits[:, self.n_routed_experts :]
+            shared_output = F.sigmoid(shared_gate_logits) * shared_output
+            final_hidden_states = shared_output + routed_output
+        else:
+            final_hidden_states = routed_output
 
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
