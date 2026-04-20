@@ -195,6 +195,10 @@ class AttentionMetaData:
     num_cached_tokens: Optional[torch.Tensor] = None
     seq_starts: Optional[torch.Tensor] = None
 
+    sparse_cu_seqlens_q: Optional[torch.Tensor] = None
+    token_to_seq_idxs: Optional[torch.Tensor] = None
+    sparse_indexer_cu_base: Optional[torch.Tensor] = None
+
     # only used for plugin mode to store the metadata for attn
     plugin_metadata: Optional["MetadataForPluginMode"] = None
 
@@ -224,6 +228,7 @@ class AttentionMetaData:
         block_tables_converted: Optional[torch.Tensor] = None,
         sparse_cu_seqlens_q: Optional[torch.Tensor] = None,
         token_to_seq_idxs: Optional[torch.Tensor] = None,
+        sparse_indexer_cu_base: Optional[torch.Tensor] = None,
         plugin_metadata: Optional["MetadataForPluginMode"] = None,
         has_cached: bool = False,
         total_kv: Optional[int] = None,
@@ -259,6 +264,7 @@ class AttentionMetaData:
             self.block_tables = block_tables_converted
         self.sparse_cu_seqlens_q = sparse_cu_seqlens_q
         self.token_to_seq_idxs = token_to_seq_idxs
+        self.sparse_indexer_cu_base = sparse_indexer_cu_base
         if plugin_metadata is not None:
             self.plugin_metadata = plugin_metadata
 

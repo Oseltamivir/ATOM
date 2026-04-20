@@ -1018,7 +1018,7 @@ class ModelRunner:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 block_bytes += (
-                    hf_config.num_hidden_layers
+                    total_num_layers
                     * self.block_size
                     * aligned_index_dim
                     * dtypes.fp8.itemsize
@@ -1215,7 +1215,7 @@ class ModelRunner:
                 index_dim = hf_config.index_head_dim + 4
                 aligned_index_dim = ((index_dim + 15) // 16) * 16
                 self.index_cache = torch.zeros(
-                    hf_config.num_hidden_layers,
+                    total_num_layers,
                     self.num_physical_kvcache_blocks,
                     self.physical_block_size,
                     aligned_index_dim,

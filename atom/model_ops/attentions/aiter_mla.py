@@ -142,6 +142,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             )
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
+            mla_metadata["token_to_seq_idxs"] = CpuGpuBuffer(
+                self.max_num_batched_tokens, **i32_kwargs
+            )
+            mla_metadata["sparse_indexer_cu_base"] = CpuGpuBuffer(
+                self.max_bs + 1, **i32_kwargs
+            )
 
         self.model_runner.forward_vars.update(mla_metadata)
 
@@ -238,11 +244,17 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     ):
         var = self.model_runner.forward_vars
         kv_indptr = var["kv_indptr"].gpu[: bs + 1]
+        # Dense and sparse both use the same paged kv_indptr bump then regenerate kv_indices.
+        assert self.block_size == 1
+        kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
+
         if self.is_sparse:
-            assert False, "TODO: MTP decode is not supported for sparse attention yet"
-        else:
-            assert self.block_size == 1
-            kv_indptr += var["cu_seqlens_q"].gpu[: bs + 1]
+            # Recompute sparse_kv_indptr from updated kv_indptr, capped at index_topk.
+            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+            kv_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+            sparse_lens = torch.clamp(kv_lens, max=self.index_topk)
+            sparse_kv_indptr[0] = 0
+            sparse_kv_indptr[1 : bs + 1] = torch.cumsum(sparse_lens, dim=0)
 
         kv_indices_generate_triton(
             var["block_tables"].gpu[:bs],
@@ -424,16 +436,35 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             "kv_last_page_lens",
         }
 
+        sparse_indptr_copy_len = bs + 1
         if self.is_sparse:
             index_topk = self.index_topk
-            sparse_context_lens = np.clip(var["context_lens"].np[:bs], None, index_topk)
-            var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
-                sparse_context_lens, dtype=np.int32
-            )
-            var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
-                "sparse_kv_indptr"
-            ].np[scheduled_bs]
-            vars_used.append(("sparse_kv_indptr", bs + 1))
+            # Per-query-token CSR for sparse MLA (MTP decode: B = scheduled_bs * max_seqlen_q).
+            if max_seqlen_q > 1:
+                B = sum_scheduled_tokens
+                ctx_per_tok = np.repeat(
+                    var["context_lens"].np[:scheduled_bs], max_seqlen_q
+                )
+                sparse_row_lens = np.minimum(ctx_per_tok, index_topk).astype(np.int32)
+                var["sparse_kv_indptr"].np[0] = 0
+                var["sparse_kv_indptr"].np[1 : B + 1] = np.cumsum(
+                    sparse_row_lens, dtype=np.int32
+                )
+                last = var["sparse_kv_indptr"].np[B]
+                var["sparse_kv_indptr"].np[B + 1 : bs + 1] = last
+                sparse_indptr_copy_len = B + 1
+            else:
+                sparse_context_lens = np.clip(
+                    var["context_lens"].np[:bs], None, index_topk
+                )
+                var["sparse_kv_indptr"].np[0] = 0
+                var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
+                    sparse_context_lens, dtype=np.int32
+                )
+                var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
+                    "sparse_kv_indptr"
+                ].np[scheduled_bs]
+            vars_used.append(("sparse_kv_indptr", sparse_indptr_copy_len))
             metadata_deps.add("sparse_kv_indptr")
 
         prep_stream = self.prep_stream
@@ -473,10 +504,30 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         #             self.block_ratio,
         #         )
         #         ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
+        sparse_mtp_extra = {}
+        if self.is_sparse and max_seqlen_q > 1:
+            nst = batch.num_scheduled_tokens[:scheduled_bs]
+            tts = np.repeat(
+                np.arange(scheduled_bs, dtype=np.int32),
+                nst.astype(np.int64),
+            )
+            assert len(tts) == sum_scheduled_tokens, (
+                f"token_to_seq_idxs len {len(tts)} != sum_scheduled_tokens="
+                f"{sum_scheduled_tokens}"
+            )
+            var["token_to_seq_idxs"].np[:sum_scheduled_tokens] = tts
+            var["token_to_seq_idxs"].copy_to_gpu(sum_scheduled_tokens)
+            sparse_mtp_extra["token_to_seq_idxs"] = var["token_to_seq_idxs"].gpu[
+                :sum_scheduled_tokens
+            ]
+            sparse_mtp_extra["sparse_indexer_cu_base"] = var[
+                "sparse_indexer_cu_base"
+            ].gpu[: scheduled_bs + 1]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            **sparse_mtp_extra,
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
@@ -491,9 +542,43 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
         var = self.model_runner.forward_vars
-        sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
+        sparse_kv_copy_len = bs + 1
+        if self.is_sparse:
+            index_topk = self.index_topk
+            if max_q_len > 1:
+                B = bs * max_q_len
+                ctx_per_tok = np.repeat(var["context_lens"].np[:bs], max_q_len)
+                sparse_row_lens = np.minimum(ctx_per_tok, index_topk).astype(np.int32)
+                var["sparse_kv_indptr"].np[0] = 0
+                var["sparse_kv_indptr"].np[1 : B + 1] = np.cumsum(
+                    sparse_row_lens, dtype=np.int32
+                )
+                last = int(var["sparse_kv_indptr"].np[B])
+                var["sparse_kv_indptr"].np[B + 1 : bs + 1] = last
+                sparse_kv_copy_len = B + 1
+                var["token_to_seq_idxs"].np[:B] = np.repeat(
+                    np.arange(bs, dtype=np.int32), max_q_len
+                )
+                var["token_to_seq_idxs"].copy_to_gpu(B)
+            else:
+                sparse_context_lens = np.clip(
+                    var["context_lens"].np[:bs], None, index_topk
+                )
+                var["sparse_kv_indptr"].np[0] = 0
+                var["sparse_kv_indptr"].np[1 : bs + 1] = np.cumsum(
+                    sparse_context_lens, dtype=np.int32
+                )
+            var["sparse_kv_indptr"].copy_to_gpu(sparse_kv_copy_len)
+        sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+        graph_sparse_mtp = {}
+        if self.is_sparse and max_q_len > 1:
+            B = bs * max_q_len
+            graph_sparse_mtp["token_to_seq_idxs"] = var["token_to_seq_idxs"].gpu[:B]
+            graph_sparse_mtp["sparse_indexer_cu_base"] = var[
+                "sparse_indexer_cu_base"
+            ].gpu[: bs + 1]
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[: bs * max_q_len],
             context_lens=var["context_lens"].gpu[:bs],
@@ -503,12 +588,19 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_indptr=var["kv_indptr"].gpu[: bs + 1],
             kv_indices=var["kv_indices"].gpu,
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
-            sparse_kv_indptr=sparse_kv_indptr,
+            sparse_kv_indptr=(
+                sparse_kv_indptr[: bs * max_q_len + 1]
+                if self.is_sparse and max_q_len > 1
+                else (
+                    sparse_kv_indptr[: bs + 1] if self.is_sparse else sparse_kv_indptr
+                )
+            ),
             block_tables_converted=(
                 var["block_tables_converted"].gpu[:bs]
                 if "block_tables_converted" in var
                 else None
             ),
+            **graph_sparse_mtp,
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q

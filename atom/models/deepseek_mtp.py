@@ -40,7 +40,12 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, atom_config: Config, prefix: str, layer_idx: int) -> None:
+    def __init__(
+        self,
+        atom_config: Config,
+        prefix: str,
+        layer_idx: int,
+    ) -> None:
         super().__init__()
 
         config = atom_config.hf_config
@@ -100,11 +105,14 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = atom_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
+
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    atom_config, f"{prefix}.layers.{idx}", layer_idx=idx
+                    atom_config,
+                    f"{prefix}.layers.{idx}",
+                    layer_idx=idx,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,

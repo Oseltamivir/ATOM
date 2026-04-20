@@ -1010,7 +1010,14 @@ def sparse_attn_indexer(
     if forward_context.context.is_dummy_run:
         # dummy runner
         return weights
-    num_decode_tokens = context.batch_size if not context.is_prefill else 0
+    # Prefill: decode rows in this op start after prefill rows (usually 0 here).
+    # Decode: hidden_states rows = all query tokens (MTP: batch * (mtp_k+1)), while
+    # context.batch_size is the sequence count only — do not use batch_size alone or
+    # top-k is only written for the first seq's rows and the rest of the buffer is garbage.
+    if context.is_prefill:
+        num_decode_tokens = 0
+    else:
+        num_decode_tokens = hidden_states.shape[0]
     indexer_k_quant_and_cache(
         k,
         kv_cache,
@@ -1079,7 +1086,15 @@ def sparse_attn_indexer(
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
-        padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+        assert num_decode_tokens == q_fp8.shape[0] == weights.shape[0], (
+            "Indexer decode: hidden_states / q_fp8 / weights row counts must match "
+            f"({num_decode_tokens=}, {q_fp8.shape[0]=}, {weights.shape[0]=})"
+        )
+        assert num_decode_tokens % context.batch_size == 0, (
+            "Indexer decode: query rows must pack evenly into batch_size "
+            f"({num_decode_tokens=}, {context.batch_size=})"
+        )
+        padded_q_fp8_decode_tokens = q_fp8.reshape(
             context.batch_size, -1, *q_fp8.shape[1:]
         )
         # TODO: move and optimize below logic with triton kernels
@@ -1437,7 +1452,7 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.is_v32 = hasattr(config, "index_topk")
 
-        if self.is_v32:
+        if self.is_v32 and topk_indices_buffer is not None:
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,

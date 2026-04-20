@@ -177,6 +177,25 @@ class EagleProposer:
                         positions = torch.gather(positions, 0, last_token_indices)
                         context.is_prefill = False
 
+                        # Sparse attention: transition sparse_kv_indptr to
+                        # single-token CSR (bs+1 entries) and provide the
+                        # identity token_to_seq_idxs / zero cu_base needed by
+                        # the DSA-prefill-style gather in _forward_decode.
+                        if self.runner.attn_metadata_builder.is_sparse:
+                            index_topk = self.runner.attn_metadata_builder.index_topk
+                            sparse_kv_indptr = var["sparse_kv_indptr"].gpu[: bs + 1]
+                            attn_metadata.sparse_kv_indptr = sparse_kv_indptr
+                            kv_lens = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
+                            sparse_lens = torch.clamp(kv_lens, max=index_topk)
+                            sparse_kv_indptr[0] = 0
+                            sparse_kv_indptr[1 : bs + 1] = torch.cumsum(
+                                sparse_lens, dim=0
+                            )
+                            attn_metadata.token_to_seq_idxs = self.arrange_bs[:bs]
+                            attn_metadata.sparse_indexer_cu_base = var[
+                                "sparse_indexer_cu_base"
+                            ].gpu[: bs + 1]
+
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(

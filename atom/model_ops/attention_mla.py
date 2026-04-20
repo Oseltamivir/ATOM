@@ -550,15 +550,51 @@ class MLAAttention(nn.Module):
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
         if self.topk_indices_buffer is not None:
-            paged_kv_indptr = attn_metadata.sparse_kv_indptr
-            paged_kv_indices = triton_convert_req_index_to_global_index(
-                attn_metadata.cu_seqlens_q,
-                attn_metadata.kv_indptr,
-                paged_kv_indptr,
-                attn_metadata.kv_indices,
-                self.topk_indices_buffer[:B],
-                NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
-            )
+            skvi = attn_metadata.sparse_kv_indptr
+            # MTP decode with multiple query tokens per seq: one sparse CSR row
+            # per query token (len = B + 1) with token_to_seq_idxs mapping each
+            # token back to its sequence.  Use DSA prefill-style gather.
+            # Single-query decode (max_seqlen_q == 1) keeps per-seq CSR and
+            # falls through to the else branch.
+            token_to_seq_idxs = getattr(attn_metadata, "token_to_seq_idxs", None)
+            cu_base = getattr(attn_metadata, "sparse_indexer_cu_base", None)
+            if (
+                skvi is not None
+                and skvi.shape[0] - 1 == B
+                and token_to_seq_idxs is not None
+                and cu_base is not None
+            ):
+                if token_to_seq_idxs.shape[0] != B:
+                    raise RuntimeError(
+                        "Sparse MTP: token_to_seq_idxs length != q.shape[0] "
+                        f"({token_to_seq_idxs.shape[0]} vs {B})"
+                    )
+                bt = attn_metadata.block_tables
+                if bt.dtype != torch.int32:
+                    raise TypeError(
+                        "Sparse MTP expects int32 block_tables in metadata "
+                        f"(got {bt.dtype})"
+                    )
+                paged_kv_indptr = skvi[: B + 1]
+                paged_kv_indices = triton_convert_req_index_to_global_index_dsa_prefill(
+                    attn_metadata.cu_seqlens_q[: B + 1],
+                    paged_kv_indptr,
+                    token_to_seq_idxs,
+                    self.topk_indices_buffer[:B],
+                    bt,
+                    cu_base,
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
+            else:
+                paged_kv_indptr = skvi
+                paged_kv_indices = triton_convert_req_index_to_global_index(
+                    attn_metadata.cu_seqlens_q,
+                    attn_metadata.kv_indptr,
+                    paged_kv_indptr,
+                    attn_metadata.kv_indices,
+                    self.topk_indices_buffer[:B],
+                    NUM_TOPK_TOKENS=self.topk_indices_buffer.shape[1],
+                )
 
         # q_scale = kv_scale = None
         # if self.kv_cache_dtype.startswith("fp8"):
@@ -878,7 +914,6 @@ def triton_convert_req_index_to_global_index(
     kv_indices_c = kv_indices.contiguous()
     token_indices_c = token_indices.contiguous()
     page_kv_indptr_c = page_kv_indptr.contiguous()
-    # TODO: not support mtp
     new_kv_indices = torch.empty_like(kv_indices)
 
     # Strides in elements

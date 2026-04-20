@@ -157,9 +157,9 @@ def rejection_greedy_sample_kernel(
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             target_argmax_id = tl.load(target_argmax_ptr + start_idx + pos)
             target_argmax_id = tl.cast(target_argmax_id, tl.int32)
-            if draft_token_id != target_argmax_id:
+            # if draft_token_id != target_argmax_id:
                 # rejected = False
-                rejected = True
+            rejected = True
             num_bonus_token += 1
         tl.store(
             output_token_ids_ptr + req_idx * (num_spec_steps + 1) + pos,
