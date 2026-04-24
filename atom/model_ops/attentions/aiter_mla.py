@@ -130,6 +130,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["sparse_kv_indptr"] = CpuGpuBuffer(
                 self.max_num_batched_tokens + 1, **i32_kwargs
             )
+            mla_metadata["sparse_kv_indptr"].np[:] = 0
+            mla_metadata["sparse_kv_indptr"].copy_to_gpu()
             mla_metadata["sparse_cu_seqlens_q"] = CpuGpuBuffer(
                 self.max_num_batched_tokens + 1, **i32_kwargs
             )
@@ -544,8 +546,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[1 : sum_scheduled_tokens + 1] = np.cumsum(
                     sparse_per_token_lens, dtype=np.int32
                 )
-                vars_used.append(("sparse_kv_indptr", sum_scheduled_tokens + 1))
-                vars_used.append(("sparse_cu_seqlens_q", sum_scheduled_tokens + 1))
+                sum_tokens = bs * max_seqlen_q
+                var["sparse_kv_indptr"].np[
+                    sum_scheduled_tokens + 1 : sum_tokens + 1
+                ] = var["sparse_kv_indptr"].np[sum_scheduled_tokens]
+                vars_used.append(("sparse_kv_indptr", sum_tokens + 1))
+                vars_used.append(("sparse_cu_seqlens_q", sum_tokens + 1))
                 metadata_deps.add("sparse_kv_indptr")
             else:
                 sparse_context_lens = np.clip(
@@ -629,10 +635,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:sum_scheduled_tokens]
-            self._token_to_seq_idxs_gpu[:sum_scheduled_tokens] = (
-                torch.arange(scheduled_bs, dtype=torch.int32, device=self.device)
-                .repeat_interleave(max_seqlen_q)
-            )
+            self._token_to_seq_idxs_gpu[:sum_scheduled_tokens] = torch.arange(
+                scheduled_bs, dtype=torch.int32, device=self.device
+            ).repeat_interleave(max_seqlen_q)
             attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
                 :sum_scheduled_tokens
             ]
@@ -685,13 +690,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:sum_tokens]
-            self._token_to_seq_idxs_gpu[:sum_tokens] = (
-                torch.arange(bs, dtype=torch.int32, device=self.device)
-                .repeat_interleave(max_q_len)
-            )
-            attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
-                :sum_tokens
-            ]
+            self._token_to_seq_idxs_gpu[:sum_tokens] = torch.arange(
+                bs, dtype=torch.int32, device=self.device
+            ).repeat_interleave(max_q_len)
+            attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
