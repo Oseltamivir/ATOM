@@ -20,7 +20,6 @@ env:
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
   NIGHTLY_SGLANG_IMAGE_TAG: rocm/atom-dev:sglang-latest
-  SGLANG_IMAGE_REPO: rocm/atom-dev
   SGLANG_REF: "v0.5.10"
 
 jobs:
@@ -244,49 +243,34 @@ jobs:
               --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
               --build-arg INSTALL_LM_EVAL=1 \
               -f Dockerfile.mod .
-          else
-            DOCKER_BUILDKIT=1 docker build --pull --network=host \
-              --no-cache \
-              -t atom_sglang_base:ci \
-              --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
-              --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
-              --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
-              --build-arg SGLANG_REF="${SGLANG_REF}" \
-              --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
-              --build-arg INSTALL_LM_EVAL=1 \
-              -f Dockerfile.mod .
-
-            DOCKER_BUILDKIT=1 docker build --network=host \
-              --no-cache \
-              -t atom_sglang:ci \
-              --target atom_sglang \
-              --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
-              --build-arg MAX_JOBS=64 \
-              --build-arg SGLANG_REF="${SGLANG_REF}" \
-              --build-arg INSTALL_LM_EVAL=1 \
-              --build-arg INSTALL_FASTSAFETENSORS=1 \
-              -f docker/Dockerfile .
+            exit 0
           fi
 
-          SHORT_SHA="$(git rev-parse --short HEAD)"
-          SAFE_SGLANG_REF="$(printf '%s' "${SGLANG_REF}" | tr '/:' '--')"
-          SGLANG_IMAGE_PUSH_TAG="${SGLANG_IMAGE_REPO}:sglang-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_SGLANG_REF}"
-          echo "SGLANG_IMAGE_PUSH_TAG=${SGLANG_IMAGE_PUSH_TAG}" >> "$GITHUB_ENV"
+          DOCKER_BUILDKIT=1 docker build --pull --network=host \
+            --no-cache \
+            -t atom_sglang_base:ci \
+            --build-arg SGLANG_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
+            --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg AITER_ARTIFACT_ID="${AITER_ARTIFACT_ID}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            -f Dockerfile.mod .
+
+          DOCKER_BUILDKIT=1 docker build --network=host \
+            --no-cache \
+            -t atom_sglang:ci \
+            --target atom_sglang \
+            --build-arg SGLANG_BASE_IMAGE="atom_sglang_base:ci" \
+            --build-arg MAX_JOBS=64 \
+            --build-arg SGLANG_REF="${SGLANG_REF}" \
+            --build-arg INSTALL_LM_EVAL=1 \
+            --build-arg INSTALL_FASTSAFETENSORS=1 \
+            -f docker/Dockerfile .
 
       - name: Set SGLANG image tag
         run: |
           echo "SGLANG_IMAGE_TAG=atom_sglang:ci" >> "$GITHUB_ENV"
-
-      - name: Push SGLANG image
-        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
-        run: |
-          if [ -z "${SGLANG_IMAGE_PUSH_TAG:-}" ]; then
-            echo "ERROR: SGLANG_IMAGE_PUSH_TAG is not set"
-            exit 1
-          fi
-          docker tag "atom_sglang:ci" "${SGLANG_IMAGE_PUSH_TAG}"
-          docker push "${SGLANG_IMAGE_PUSH_TAG}"
-          echo "Pushed SGLANG image: ${SGLANG_IMAGE_PUSH_TAG}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare model cache mount
         run: |
@@ -487,9 +471,6 @@ jobs:
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
-          if [ -n "${SGLANG_IMAGE_PUSH_TAG:-}" ]; then
-            docker rmi "${SGLANG_IMAGE_PUSH_TAG}" || true
-          fi
           docker rmi "atom_sglang_base:ci" || true
           docker rmi "atom_sglang:ci" || true
 
