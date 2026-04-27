@@ -10,6 +10,12 @@ set -euo pipefail
 #   OOT_MODEL_PATH
 #   OOT_EXTRA_ARGS
 #   LM_EVAL_NUM_FEWSHOT
+#   ACCURACY_TASK     (gsm8k | gsm8k_cot, default: gsm8k)
+#                     gsm8k_cot uses chat-completions endpoint + apply_chat_template
+#                     and ignores LM_EVAL_NUM_FEWSHOT (defers to YAML 8-shot).
+#                     This mirrors the standalone CF-PROGRESS-0427 refactor.
+#   KEEP_SERVER_ALIVE_ON_EXIT=1  (used by both launch and accuracy phases when
+#                     the same vLLM server should be reused across steps)
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
@@ -51,10 +57,16 @@ EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
 OOT_DOCKER_IMAGE=${OOT_DOCKER_IMAGE:-}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
+ACCURACY_TASK=${ACCURACY_TASK:-gsm8k}
 LAST_VLLM_LOG_LINE=0
 
 if ! [[ "${LM_EVAL_NUM_FEWSHOT}" =~ ^[0-9]+$ ]]; then
   echo "Invalid LM_EVAL_NUM_FEWSHOT: ${LM_EVAL_NUM_FEWSHOT}. Expected a non-negative integer."
+  exit 2
+fi
+
+if [[ "${ACCURACY_TASK}" != "gsm8k" && "${ACCURACY_TASK}" != "gsm8k_cot" ]]; then
+  echo "Invalid ACCURACY_TASK: ${ACCURACY_TASK}. Expected: gsm8k or gsm8k_cot"
   exit 2
 fi
 
@@ -141,6 +153,19 @@ stop_server() {
   fi
 }
 
+server_already_running() {
+  if [[ -f "${VLLM_PID_FILE}" ]]; then
+    local pid
+    pid=$(cat "${VLLM_PID_FILE}" 2>/dev/null || echo "")
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      if curl -fsS "http://127.0.0.1:${VLLM_PORT}/v1/models" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
 launch_one_model() {
   local model_name="$1"
   local model_path="$2"
@@ -149,6 +174,11 @@ launch_one_model() {
 
   local resolved_model_path
   resolved_model_path=$(resolve_model_path "${model_path}")
+
+  if server_already_running; then
+    echo "Reusing already-running vLLM server (PID $(cat "${VLLM_PID_FILE}"))."
+    return 0
+  fi
 
   if [[ -n "${extra_args}" ]]; then
     while IFS= read -r -d '' token; do
@@ -186,7 +216,6 @@ PY
 
   rm -f "${VLLM_PID_FILE}" || true
 
-  # Avoid importing a host-mounted source tree as a namespace package.
   cd /tmp
   nohup vllm serve "${resolved_model_path}" \
     --host "${VLLM_HOST}" \
@@ -227,19 +256,34 @@ accuracy_one_model() {
   flat_result_file="${RESULT_DIR}/${run_tag}.json"
 
   echo ""
-  echo "========== Running OOT gsm8k accuracy =========="
+  echo "========== Running OOT ${ACCURACY_TASK} accuracy =========="
   echo "Model name: ${model_name}"
-  echo "Few-shot count: ${LM_EVAL_NUM_FEWSHOT}"
+  echo "Task: ${ACCURACY_TASK}"
 
-  lm_eval --model local-completions \
-    --model_args model="${resolved_model_path}",base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions",num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
-    --tasks gsm8k \
-    --num_fewshot "${LM_EVAL_NUM_FEWSHOT}" \
+  local eval_model
+  local eval_base_url
+  local apply_chat_template_arg=""
+  local num_fewshot_arg=""
+
+  if [[ "${ACCURACY_TASK}" == "gsm8k_cot" ]]; then
+    eval_model="local-chat-completions"
+    eval_base_url="http://127.0.0.1:${VLLM_PORT}/v1/chat/completions"
+    apply_chat_template_arg="--apply_chat_template"
+    echo "Few-shot: YAML default (8-shot CoT)"
+  else
+    eval_model="local-completions"
+    eval_base_url="http://127.0.0.1:${VLLM_PORT}/v1/completions"
+    num_fewshot_arg="--num_fewshot ${LM_EVAL_NUM_FEWSHOT}"
+    echo "Few-shot: ${LM_EVAL_NUM_FEWSHOT}"
+  fi
+
+  lm_eval --model "${eval_model}" \
+    --model_args model="${resolved_model_path}",base_url="${eval_base_url}",num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
+    --tasks "${ACCURACY_TASK}" \
+    ${apply_chat_template_arg} \
+    ${num_fewshot_arg} \
     --output_path "${output_path}" 2>&1 | tee -a "${ACCURACY_LOG_FILE}"
 
-  # lm-eval output layout differs across versions: output_path may be a file
-  # or a directory containing one/more JSON files. Follow native CI style:
-  # resolve the latest generated JSON first, then parse metrics from it.
   local result_file=""
   result_file=$(python - <<PY
 from pathlib import Path
@@ -267,8 +311,6 @@ PY
     return 2
   fi
 
-  # Flatten the result into RESULT_DIR so workflow-side checks can use the
-  # same simple `ls`-based lookup as atom-test without depending on Python.
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
@@ -308,13 +350,14 @@ PY
 
   local value
   if command -v jq >/dev/null 2>&1; then
-    value=$(jq '.results.gsm8k["exact_match,flexible-extract"]' "${result_file}")
+    value=$(jq ".results.${ACCURACY_TASK}[\"exact_match,flexible-extract\"]" "${result_file}")
   else
-    value=$(python - <<PY
+    value=$(RESULT_FILE="${result_file}" ACC_TASK="${ACCURACY_TASK}" python - <<'PY'
 import json
-with open("${result_file}", "r", encoding="utf-8") as f:
+import os
+with open(os.environ["RESULT_FILE"], "r", encoding="utf-8") as f:
     data = json.load(f)
-print(data["results"]["gsm8k"]["exact_match,flexible-extract"])
+print(data["results"][os.environ["ACC_TASK"]]["exact_match,flexible-extract"])
 PY
 )
   fi
@@ -340,10 +383,11 @@ run_for_models() {
       break
     fi
 
-    # accuracy mode: launch + evaluate each selected model, then stop server.
     launch_one_model "${model_name}" "${model_path}" "${extra_args}"
     accuracy_one_model "${model_name}" "${model_path}" "${extra_args}"
-    stop_server
+    if [[ "${KEEP_SERVER_ALIVE_ON_EXIT}" != "1" ]]; then
+      stop_server
+    fi
   done
 
   if [[ "${matched}" -eq 0 ]]; then
@@ -353,7 +397,7 @@ run_for_models() {
 }
 
 cleanup_on_exit() {
-  if [[ "${TYPE}" == "launch" && "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
+  if [[ "${KEEP_SERVER_ALIVE_ON_EXIT}" == "1" ]]; then
     echo "Keeping vLLM server alive for follow-up steps."
     return 0
   fi
@@ -367,4 +411,3 @@ if [[ "${TYPE}" == "launch" ]]; then
 else
   run_for_models "accuracy"
 fi
-
