@@ -126,20 +126,23 @@ if [ "$TYPE" == "accuracy" ]; then
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
 
   if [ "$ACCURACY_TASK" = "gsm8k_cot" ]; then
-    lm_eval --model openai-chat-completions \
-            --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/chat/completions,num_concurrent=65,max_retries=3" \
-            --tasks "${ACCURACY_TASK}" \
-            --apply_chat_template \
-            --output_path "${OUTPUT_PATH}" \
-            2>&1 | tee "$ATOM_CLIENT_LOG"
+    EVAL_MODEL="local-chat-completions"
+    EVAL_BASE_URL="http://localhost:8000/v1/chat/completions"
+    APPLY_CHAT_TEMPLATE="--apply_chat_template"
+    NUM_FEWSHOT_ARG=""
   else
-    lm_eval --model local-completions \
-            --model_args "model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
-            --tasks "${ACCURACY_TASK}" \
-            --num_fewshot 3 \
-            --output_path "${OUTPUT_PATH}" \
-            2>&1 | tee "$ATOM_CLIENT_LOG"
+    EVAL_MODEL="local-completions"
+    EVAL_BASE_URL="http://localhost:8000/v1/completions"
+    APPLY_CHAT_TEMPLATE=""
+    NUM_FEWSHOT_ARG="--num_fewshot 3"
   fi
+  lm_eval --model "$EVAL_MODEL" \
+          --model_args "model=${MODEL_PATH},base_url=${EVAL_BASE_URL},num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+          --tasks "${ACCURACY_TASK}" \
+          $APPLY_CHAT_TEMPLATE \
+          $NUM_FEWSHOT_ARG \
+          --output_path "${OUTPUT_PATH}" \
+          2>&1 | tee "$ATOM_CLIENT_LOG"
 
   RESULT_FILENAME=$(
     python3 - <<PY
