@@ -177,7 +177,7 @@ class EngineCore:
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=5.0)
+        self.output_thread.join(timeout=0.5)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
