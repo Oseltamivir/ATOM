@@ -15,6 +15,8 @@ kernel's accumulation precision. They are correct but not performant.
 
 from typing import Tuple
 
+import os
+
 import torch
 
 # ---------------------------------------------------------------------------
@@ -68,6 +70,87 @@ def sparse_attn(
 
     out_dtype = q.dtype
     device = q.device
+
+    if os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN", "1") == "1" and q.is_cuda:
+        try:
+            from aiter.ops.triton.attention.sparse_mqa_sink import sparse_mqa_sink
+
+            block_size = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_BLOCK_SIZE", "128")
+                or "128"
+            )
+            q_flat = q.reshape(B * M, H, D).contiguous()
+            topk_flat = topk_idxs.reshape(B * M, K).contiguous().int()
+            num_blocks = (N + block_size - 1) // block_size
+            padded_n = num_blocks * block_size
+            if padded_n != N:
+                kv_padded = kv.new_zeros((B, padded_n, D))
+                kv_padded[:, :N] = kv
+            else:
+                kv_padded = kv.contiguous()
+            kv_blocks = (
+                kv_padded.view(B, num_blocks, block_size, D)
+                .reshape(B * num_blocks, block_size, D)
+                .contiguous()
+            )
+            block_table = torch.arange(
+                B * num_blocks, device=device, dtype=torch.int32
+            ).view(B, num_blocks)
+            cu_seqlens_q = torch.arange(
+                0, (B + 1) * M, M, device=device, dtype=torch.int32
+            )
+            seqused_k = torch.full((B,), N, device=device, dtype=torch.int32)
+            out = torch.empty_like(q_flat)
+            sparse_mqa_sink(
+                q_flat,
+                kv_blocks,
+                out,
+                cu_seqlens_q,
+                seqused_k,
+                float(softmax_scale),
+                topk_flat,
+                block_table,
+                attn_sink.float().contiguous(),
+            )
+            return out.view(B, M, H, D).to(out_dtype)
+        except Exception as exc:
+            if os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_STRICT", "1") == "1":
+                raise
+            print(f"WARN: AITER DSv4 sparse_attn failed, falling back to Torch: {exc!r}")
+
+    chunk_tokens = int(os.environ.get("ATOM_DSV4_SPARSE_ATTN_CHUNK_TOKENS", "0") or "0")
+    if B == 1 and chunk_tokens > 0 and M > chunk_tokens:
+        return torch.cat(
+            [
+                sparse_attn(
+                    q[:, start : start + chunk_tokens],
+                    kv,
+                    attn_sink,
+                    topk_idxs[:, start : start + chunk_tokens],
+                    softmax_scale,
+                )
+                for start in range(0, M, chunk_tokens)
+            ],
+            dim=1,
+        )
+
+    if B == 1 and M == 1:
+        valid_1d = topk_idxs[0, 0] != -1
+        if not bool(valid_1d.any()):
+            return torch.zeros_like(q)
+        idx_1d = topk_idxs[0, 0]
+        if bool(valid_1d.all()):
+            kv_f32 = kv[0].index_select(0, idx_1d.long()).float()
+        else:
+            kv_f32 = kv[0].index_select(0, idx_1d[valid_1d].long()).float()
+        q_f32 = q[0, 0].float()
+        scores = torch.matmul(q_f32, kv_f32.transpose(0, 1)) * float(softmax_scale)
+        sink = attn_sink.float().view(H, 1)
+        cmax = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+        exp_scores = (scores - cmax).exp()
+        denom = exp_scores.sum(dim=-1, keepdim=True) + (sink - cmax).exp()
+        out = (exp_scores / denom.clamp(min=1e-30)).matmul(kv_f32)
+        return out.view(1, 1, H, D).to(out_dtype)
 
     # ----- Gather KV per query position -----
     # safe_idxs avoids out-of-bounds for the -1 sentinel; we mask the result below.

@@ -171,8 +171,17 @@ class InputOutputProcessor:
             self.num_speculative_tokens = (
                 self.config.speculative_config.num_speculative_tokens
             )
-        mamba_model_types = {"qwen3_next", "qwen3_5_text", "qwen3_5_moe_text"}
-        if self.config.hf_config.model_type in mamba_model_types:
+        mamba_model_types = {
+            "qwen3_next",
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+            "deepseek_v4",
+            "deepseek_v4_pro",
+        }
+        architectures = getattr(self.config.hf_config, "architectures", []) or []
+        if self.config.hf_config.model_type in mamba_model_types or any(
+            "DeepseekV4" in arch for arch in architectures
+        ):
             self.mamba_enabled = True
 
     def preprocess(

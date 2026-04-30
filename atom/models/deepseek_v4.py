@@ -506,7 +506,9 @@ class Compressor(nn.Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> Optional[torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, start_pos: int, cache_slot: int = 0
+    ) -> Optional[torch.Tensor]:
         """Compress KV for the input tokens. Writes into self.kv_cache when a
         compression block boundary is hit; otherwise just buffers state and returns None.
 
@@ -524,6 +526,7 @@ class Compressor(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)  # [num_tokens, dim] → [1, num_tokens, dim]
         bsz, seqlen, _ = x.size()
+        slot = slice(cache_slot, cache_slot + bsz)
         ratio = self.compress_ratio
         overlap = self.overlap
         d = self.head_dim
@@ -545,16 +548,16 @@ class Compressor(nn.Module):
             # Save the last `ratio` overlap-slice tokens into kv_state for use
             # by the next decode call's overlap window.
             if overlap and cutoff >= ratio:
-                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
-                self.score_state[:bsz, :ratio] = (
+                self.kv_state[slot, :ratio] = kv[:, cutoff - ratio : cutoff]
+                self.score_state[slot, :ratio] = (
                     score[:, cutoff - ratio : cutoff] + self.ape
                 )
             # Save the trailing partial block (remainder tokens) into kv_state.
             if remainder > 0:
-                kv, self.kv_state[:bsz, offset : offset + remainder] = kv.split(
+                kv, self.kv_state[slot, offset : offset + remainder] = kv.split(
                     [cutoff, remainder], dim=1
                 )
-                self.score_state[:bsz, offset : offset + remainder] = (
+                self.score_state[slot, offset : offset + remainder] = (
                     score[:, cutoff:] + self.ape[:remainder]
                 )
                 score = score[:, :cutoff]
@@ -570,20 +573,20 @@ class Compressor(nn.Module):
             should_compress = (start_pos + 1) % self.compress_ratio == 0
             score = score + self.ape[start_pos % ratio]
             if overlap:
-                self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+                self.kv_state[slot, ratio + start_pos % ratio] = kv.squeeze(1)
+                self.score_state[slot, ratio + start_pos % ratio] = score.squeeze(1)
                 if should_compress:
                     kv_state = torch.cat(
                         [
-                            self.kv_state[:bsz, :ratio, :d],
-                            self.kv_state[:bsz, ratio:, d:],
+                            self.kv_state[slot, :ratio, :d],
+                            self.kv_state[slot, ratio:, d:],
                         ],
                         dim=1,
                     )
                     score_state = torch.cat(
                         [
-                            self.score_state[:bsz, :ratio, :d],
-                            self.score_state[:bsz, ratio:, d:],
+                            self.score_state[slot, :ratio, :d],
+                            self.score_state[slot, ratio:, d:],
                         ],
                         dim=1,
                     )
@@ -591,14 +594,14 @@ class Compressor(nn.Module):
                         dim=1, keepdim=True
                     )
                     # Roll: the just-completed window becomes the next overlap window.
-                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+                    self.kv_state[slot, :ratio] = self.kv_state[slot, ratio:]
+                    self.score_state[slot, :ratio] = self.score_state[slot, ratio:]
             else:
-                self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
-                self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+                self.kv_state[slot, start_pos % ratio] = kv.squeeze(1)
+                self.score_state[slot, start_pos % ratio] = score.squeeze(1)
                 if should_compress:
                     kv = (
-                        self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
+                        self.kv_state[slot] * self.score_state[slot].softmax(dim=1)
                     ).sum(dim=1, keepdim=True)
 
         if not should_compress:
@@ -622,9 +625,9 @@ class Compressor(nn.Module):
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
         if start_pos == 0:
-            self.kv_cache[:bsz, : seqlen // ratio] = kv
+            self.kv_cache[slot, : seqlen // ratio] = kv
         else:
-            self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+            self.kv_cache[slot, start_pos // ratio] = kv.squeeze(1)
         return kv
 
 
@@ -696,6 +699,7 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         start_pos: int,
         offset: int,
+        cache_slot: int = 0,
     ) -> torch.Tensor:
         """Compute sparse top-k indices over the indexer's compressed KV cache.
 
@@ -715,6 +719,7 @@ class Indexer(nn.Module):
         ratio = self.compress_ratio
         rd = self.rope_head_dim
         end_pos = start_pos + seqlen
+        slot = slice(cache_slot, cache_slot + 1)
 
         # Lazy plumb the indexer's kv_cache + freqs_cis into its compressor.
         if self.compressor.kv_cache is None:
@@ -729,26 +734,51 @@ class Indexer(nn.Module):
         fp4_act_quant_inplace(q, _FP4_BLOCK_SIZE)
 
         # ----- Indexer KV (Compressor takes 2D, mutates kv_cache) -----
-        self.compressor(x, start_pos)
+        self.compressor(x, start_pos, cache_slot)
         # weights_proj is ATOM Linear → 2D input; restore B=1 dim for einsum.
         weights = (
             self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         ).unsqueeze(0)
 
-        # ----- Index score -----
+        # ----- Index score / top-k selection over compressed positions -----
+        n_committed = end_pos // ratio
+        if n_committed <= 0:
+            return torch.empty(1, seqlen, 0, dtype=torch.int32, device=x.device)
+
+        if os.environ.get("ATOM_DSV4_AITER_INDEXER", "1") == "1" and q.is_cuda:
+            try:
+                from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer_topk
+
+                positions = torch.arange(
+                    start_pos, end_pos, device=x.device, dtype=torch.int64
+                )
+                topk_idxs = dsv4_indexer_topk(
+                    q.squeeze(0),
+                    self.kv_cache[slot, :n_committed].squeeze(0),
+                    weights.squeeze(0),
+                    positions,
+                    self.index_topk,
+                    offset,
+                    ratio=ratio,
+                )
+                return topk_idxs.unsqueeze(0)
+            except Exception as exc:
+                if os.environ.get("ATOM_DSV4_AITER_INDEXER_STRICT", "1") == "1":
+                    raise
+                print(f"WARN: AITER DSv4 Indexer failed, falling back to Torch: {exc!r}")
+
         index_score = torch.einsum(
-            "bshd,btd->bsht", q, self.kv_cache[:1, : end_pos // ratio]
+            "bshd,btd->bsht", q, self.kv_cache[slot, :n_committed]
         )
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
-        # ----- Top-k selection over compressed positions -----
         if start_pos == 0:
             mask = (
                 torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
                 >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             )
             index_score = index_score + torch.where(mask, float("-inf"), 0.0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
+        topk_idxs = index_score.topk(min(self.index_topk, n_committed), dim=-1)[1]
         if start_pos == 0:
             mask = (
                 topk_idxs
@@ -959,7 +989,9 @@ class DeepseekV4Attention(nn.Module):
 
         self.wo_a.quant_type = _QT.No
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, start_pos: int, cache_slot: int = 0
+    ) -> torch.Tensor:
         """Compute attention for `x` at absolute position `start_pos`.
 
         Args:
@@ -978,6 +1010,7 @@ class DeepseekV4Attention(nn.Module):
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        slot = slice(cache_slot, cache_slot + 1)
 
         # First-call plumbing: hand the (compressed-half) KV cache + freqs_cis
         # to the compressor / indexer.
@@ -992,14 +1025,14 @@ class DeepseekV4Attention(nn.Module):
         # with garbage. Real prefill only overwrites a few slots, leaving
         # stale warmup data that poisons decode attention.
         if start_pos == 0:
-            self.kv_cache.zero_()
+            self.kv_cache[slot].zero_()
             if self.compress_ratio:
-                self.compressor.kv_state.zero_()
-                self.compressor.score_state.fill_(float("-inf"))
+                self.compressor.kv_state[slot].zero_()
+                self.compressor.score_state[slot].fill_(float("-inf"))
                 if self.indexer is not None:
-                    self.indexer.kv_cache.zero_()
-                    self.indexer.compressor.kv_state.zero_()
-                    self.indexer.compressor.score_state.fill_(float("-inf"))
+                    self.indexer.kv_cache[slot].zero_()
+                    self.indexer.compressor.kv_state[slot].zero_()
+                    self.indexer.compressor.score_state[slot].fill_(float("-inf"))
 
         # ----- Q: low-rank projection + per-head RMSNorm + partial RoPE -----
         # ATOM TP linears require 2D inputs; subsequent ops (RoPE, sparse_attn)
@@ -1023,7 +1056,7 @@ class DeepseekV4Attention(nn.Module):
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
-                compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
+                compress_topk_idxs = self.indexer(x, qr, start_pos, offset, cache_slot)
             else:
                 compress_topk_idxs = _get_compress_topk_idxs(
                     ratio, 1, seqlen, start_pos, offset, device=x.device
@@ -1037,26 +1070,26 @@ class DeepseekV4Attention(nn.Module):
         # implicit B=1.) -----
         if start_pos == 0:
             if seqlen <= win:
-                self.kv_cache[:1, :seqlen] = kv
+                self.kv_cache[slot, :seqlen] = kv
             else:
                 cutoff = seqlen % win
                 (
-                    self.kv_cache[:1, cutoff:win],
-                    self.kv_cache[:1, :cutoff],
+                    self.kv_cache[slot, cutoff:win],
+                    self.kv_cache[slot, :cutoff],
                 ) = kv[
                     :, -win:
                 ].split([win - cutoff, cutoff], dim=1)
             if self.compress_ratio:
-                if (kv_compress := self.compressor(x, start_pos)) is not None:
+                if (kv_compress := self.compressor(x, start_pos, cache_slot)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
-            self.kv_cache[:1, start_pos % win] = kv.squeeze(1)
+            self.kv_cache[slot, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
-                self.compressor(x, start_pos)
+                self.compressor(x, start_pos, cache_slot)
             o = sparse_attn(
                 q,
-                self.kv_cache[:1],
+                self.kv_cache[slot],
                 self.attn_sink,
                 topk_idxs,
                 self.softmax_scale,
@@ -1073,6 +1106,100 @@ class DeepseekV4Attention(nn.Module):
         o = torch.einsum("sgd,grd->sgr", o, wo_a)  # [S, g, o_lora_rank]
         x = self.wo_b(o.flatten(1))  # 2D [S, dim]
         return x
+
+    def forward_batched(
+        self, x: torch.Tensor, seq_meta: list[tuple[int, int, int, int]]
+    ) -> torch.Tensor:
+        assert (
+            x.dim() == 2
+        ), f"DeepseekV4Attention expects 2D [num_tokens, dim], got {x.shape}"
+        total_tokens = x.size(0)
+        win = self.window_size
+        ratio = self.compress_ratio
+        rd = self.rope_head_dim
+
+        if self.compress_ratio and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, win:]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+        qr_all = self.q_norm(self.wq_a(x))
+        q_all = self.wq_b(qr_all).view(total_tokens, self.n_local_heads, self.head_dim)
+        q_all = q_all * torch.rsqrt(q_all.square().mean(-1, keepdim=True) + self.eps)
+        kv_all = self.kv_norm(self.wkv(x)).view(total_tokens, self.head_dim)
+
+        outputs = []
+        for start, end, start_pos, cache_slot in seq_meta:
+            seqlen = end - start
+            freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+            slot = slice(cache_slot, cache_slot + 1)
+
+            if start_pos == 0:
+                self.kv_cache[slot].zero_()
+                if self.compress_ratio:
+                    self.compressor.kv_state[slot].zero_()
+                    self.compressor.score_state[slot].fill_(float("-inf"))
+                    if self.indexer is not None:
+                        self.indexer.kv_cache[slot].zero_()
+                        self.indexer.compressor.kv_state[slot].zero_()
+                        self.indexer.compressor.score_state[slot].fill_(float("-inf"))
+
+            q = q_all[start:end].unsqueeze(0)
+            _apply_rotary_emb(q[..., -rd:], freqs_cis)
+            kv = kv_all[start:end].unsqueeze(0)
+            _apply_rotary_emb(kv[..., -rd:], freqs_cis)
+            act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+
+            topk_idxs = _get_window_topk_idxs(
+                win, 1, seqlen, start_pos, device=x.device
+            )
+            if self.compress_ratio:
+                offset = kv.size(1) if start_pos == 0 else win
+                if self.indexer is not None:
+                    compress_topk_idxs = self.indexer(
+                        x[start:end], qr_all[start:end], start_pos, offset, cache_slot
+                    )
+                else:
+                    compress_topk_idxs = _get_compress_topk_idxs(
+                        ratio, 1, seqlen, start_pos, offset, device=x.device
+                    )
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+            topk_idxs = topk_idxs.int()
+
+            if start_pos == 0:
+                if seqlen <= win:
+                    self.kv_cache[slot, :seqlen] = kv
+                else:
+                    cutoff = seqlen % win
+                    (
+                        self.kv_cache[slot, cutoff:win],
+                        self.kv_cache[slot, :cutoff],
+                    ) = kv[:, -win:].split([win - cutoff, cutoff], dim=1)
+                if self.compress_ratio:
+                    kv_compress = self.compressor(x[start:end], start_pos, cache_slot)
+                    if kv_compress is not None:
+                        kv = torch.cat([kv, kv_compress], dim=1)
+                o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+            else:
+                self.kv_cache[slot, start_pos % win] = kv.squeeze(1)
+                if self.compress_ratio:
+                    self.compressor(x[start:end], start_pos, cache_slot)
+                o = sparse_attn(
+                    q,
+                    self.kv_cache[slot],
+                    self.attn_sink,
+                    topk_idxs,
+                    self.softmax_scale,
+                )
+
+            _apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
+            outputs.append(o.squeeze(0))
+
+        o = torch.cat(outputs, dim=0).view(total_tokens, self.n_local_groups, -1)
+        wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+        o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        return self.wo_b(o.flatten(1))
 
 
 class Gate(nn.Module):
@@ -1599,6 +1726,7 @@ class Block(nn.Module):
         x: torch.Tensor,
         start_pos: int,
         input_ids: Optional[torch.Tensor],
+        cache_slot: int = 0,
     ) -> torch.Tensor:
         # ----- Attention sub-layer with mHC mixing -----
         residual = x
@@ -1606,7 +1734,7 @@ class Block(nn.Module):
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x, start_pos)
+        x = self.attn(x, start_pos, cache_slot)
         x = self.hc_post(x, residual, post, comb)
 
         # ----- FFN sub-layer with mHC mixing -----
@@ -1821,11 +1949,81 @@ class DeepseekV4Model(nn.Module):
         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
+    def _forward_one(
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int,
+        cache_slot: int,
+    ) -> torch.Tensor:
+        h = self.embed(input_ids)  # [num_tokens, dim]
+        # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
+        h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+
+        for layer in self.layers:
+            h = layer(h, start_pos, input_ids, cache_slot)
+
+        logits = self.head(
+            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+        )
+        return logits
+
+    def _head_tokens(self, h: torch.Tensor) -> torch.Tensor:
+        x = self.head.hc_head(
+            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+        )
+        return F.linear(self.norm(x).float(), self.head.weight)
+
+    def _forward_layerwise_batched(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cache_slots: torch.Tensor,
+        num_seqs: int,
+    ) -> torch.Tensor:
+        seq_meta: list[tuple[int, int, int, int]] = []
+        last_indices: list[int] = []
+        for seq_idx in range(num_seqs):
+            start = int(cu_seqlens_q[seq_idx].item())
+            end = int(cu_seqlens_q[seq_idx + 1].item())
+            if end <= start:
+                continue
+            seq_start = int(positions[start].item())
+            cache_slot = int(cache_slots[seq_idx].item())
+            seq_meta.append((start, end, seq_start, cache_slot))
+            last_indices.append(end - 1)
+        if not seq_meta:
+            return self._forward_one(input_ids[:1], 0, 0)
+
+        h = self.embed(input_ids)
+        h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+
+        for layer in self.layers:
+            residual = h
+            x, post, comb = layer.hc_pre(
+                h, layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base
+            )
+            x = layer.attn_norm(x)
+            x = layer.attn.forward_batched(x, seq_meta)
+            h = layer.hc_post(x, residual, post, comb)
+
+            residual = h
+            x, post, comb = layer.hc_pre(
+                h, layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base
+            )
+            x = layer.ffn_norm(x)
+            x = layer.ffn(x, input_ids)
+            h = layer.hc_post(x, residual, post, comb)
+
+        last_indices_t = torch.tensor(last_indices, device=h.device, dtype=torch.long)
+        return self._head_tokens(h.index_select(0, last_indices_t))
+
     @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
         start_pos: int = 0,
+        positions: Optional[torch.Tensor] = None,
         **model_kwargs: dict,
     ) -> torch.Tensor:
         """Forward.
@@ -1844,17 +2042,42 @@ class DeepseekV4Model(nn.Module):
                 input_ids.size(0) == 1
             ), "B>1 batched input_ids needs attn_metadata; not supported yet"
             input_ids = input_ids.flatten()
-        h = self.embed(input_ids)  # [num_tokens, dim]
-        # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
-        h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if positions is None:
+            positions = torch.arange(
+                start_pos,
+                start_pos + input_ids.numel(),
+                device=input_ids.device,
+                dtype=torch.int64,
+            )
+        else:
+            positions = positions.flatten()
 
-        for layer in self.layers:
-            h = layer(h, start_pos, input_ids)
+        attn_metadata = None
+        context = None
+        try:
+            from atom.utils.forward_context import get_forward_context
 
-        logits = self.head(
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm
+            forward_context = get_forward_context()
+            attn_metadata = forward_context.attn_metadata
+            context = forward_context.context
+        except Exception:
+            pass
+
+        cu_seqlens_q = getattr(attn_metadata, "cu_seqlens_q", None)
+        if cu_seqlens_q is None or context is None or context.batch_size <= 1:
+            seq_start = int(positions[0].item()) if positions.numel() else int(start_pos)
+            cache_slots = getattr(attn_metadata, "dsv4_cache_slots", None)
+            cache_slot = int(cache_slots[0].item()) if cache_slots is not None else 0
+            return self._forward_one(input_ids, seq_start, cache_slot)
+
+        num_seqs = int(context.batch_size)
+        cache_slots = getattr(attn_metadata, "dsv4_cache_slots", None)
+        if cache_slots is None or cache_slots.numel() < num_seqs:
+            cache_slots = torch.arange(num_seqs, device=input_ids.device, dtype=torch.int64)
+
+        return self._forward_layerwise_batched(
+            input_ids, positions, cu_seqlens_q, cache_slots, num_seqs
         )
-        return logits
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -1918,6 +2141,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         # config lacks `quantization_config` (e.g. dummy / toy validation),
         # this still works — base spec is QuantType.No.
         self.args.quant_config = make_v4_quant_config(self.hf_config)
+        self.args.max_batch_size = max(
+            self.args.max_batch_size, int(getattr(config, "max_num_seqs", 1))
+        )
         self.model = DeepseekV4Model(args=self.args)
 
     def forward(
@@ -1929,7 +2155,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         **model_kwargs: dict,
     ) -> torch.Tensor:
         start_pos = int(positions[0].item()) if positions is not None else 0
-        return self.model(input_ids=input_ids, start_pos=start_pos, **model_kwargs)
+        return self.model(
+            input_ids=input_ids,
+            start_pos=start_pos,
+            positions=positions,
+            **model_kwargs,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # In V4, the LM head is fused into DeepseekV4Model.forward (it consumes

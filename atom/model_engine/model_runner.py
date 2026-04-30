@@ -659,6 +659,14 @@ class ModelRunner:
             )
         return False
 
+    def is_deepseek_v4(self) -> bool:
+        model_type = getattr(self.hf_text_config, "model_type", None)
+        architectures = getattr(self.hf_text_config, "architectures", []) or []
+        return model_type in (
+            "deepseek_v4",
+            "deepseek_v4_pro",
+        ) or any("DeepseekV4" in arch for arch in architectures)
+
     def is_qwen_next(self) -> bool:
         if not hasattr(self.hf_text_config, "model_type"):
             return False
@@ -1250,9 +1258,10 @@ class ModelRunner:
 
         # GDN recurrent state: deduct mamba tensor memory from pool budget
         mamba_per_slot = self._compute_mamba_per_slot_bytes()
+        needs_recurrent_slots = mamba_per_slot > 0 or self.is_deepseek_v4()
         slots_per_req = 1 + self.num_spec_tokens
         max_mamba_slots = (
-            config.max_num_seqs * slots_per_req if mamba_per_slot > 0 else 0
+            config.max_num_seqs * slots_per_req if needs_recurrent_slots else 0
         )
         mamba_tensor_bytes = max_mamba_slots * mamba_per_slot
         available_for_pool = available_for_kv - mamba_tensor_bytes
@@ -1270,7 +1279,7 @@ class ModelRunner:
         # Store for BlockManager and allocate_kv_cache
         config.mamba_equiv_per_req = mamba_equiv
         config.max_mamba_slots = max_mamba_slots
-        config.num_mamba_groups = config.max_num_seqs if mamba_per_slot > 0 else 0
+        config.num_mamba_groups = config.max_num_seqs if needs_recurrent_slots else 0
         self.max_mamba_slots = max_mamba_slots
 
         num_kvcache_blocks = available_for_pool // block_bytes
@@ -1309,7 +1318,7 @@ class ModelRunner:
         return {
             "num_kvcache_blocks": num_kvcache_blocks,
             "mamba_equiv_per_req": mamba_equiv,
-            "num_mamba_groups": config.max_num_seqs if mamba_per_slot > 0 else 0,
+            "num_mamba_groups": config.max_num_seqs if needs_recurrent_slots else 0,
         }
 
     def allocate_kv_cache(self, num_kvcache_blocks):
@@ -1782,6 +1791,13 @@ class ModelRunner:
             )
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
+        if self.is_deepseek_v4():
+            cache_slots = list(batch.mamba_state_slots)
+            if len(cache_slots) < context_bs:
+                cache_slots = list(range(context_bs))
+            attn_metadata.dsv4_cache_slots = torch.tensor(
+                cache_slots[:context_bs], dtype=torch.int64, device=self.device
+            )
 
         # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
