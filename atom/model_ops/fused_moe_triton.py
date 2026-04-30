@@ -24,47 +24,86 @@ import logging
 from math import prod
 from aiter.jit.utils.chip_info import get_gfx
 from atom.model_ops.utils import has_triton_kernels
+from atom.model_ops.moe_utils import (
+    check_and_swizzle_scales,
+    quantize,
+)
 
 logger = logging.getLogger("atom")
 
 
 if has_triton_kernels():
-    try:
-        from triton_kernels.matmul_ogs import matmul_ogs
-        from triton_kernels.routing import routing
-        from triton_kernels.matmul_ogs import PrecisionConfig
-    except (AttributeError, ImportError) as e:
-        logger.error(
-            "Failed to import Triton kernels. Please make sure your triton "
-            "version is compatible. Error: %s",
-            e,
-        )
-
-
-def _swizzle_mxfp4(quant_tensor, scale):
-    """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
-    assert has_triton_kernels()
-    from triton_kernels.numerics import InFlexData
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
-    from triton_kernels.tensor_details.layout import StridedLayout
-
-    value_layout_opts: dict[str, Any] = {}
-    scale_layout_opts: dict[str, Any] = {}
-    value_layout = StridedLayout
-    if get_gfx() == "gfx950":
-        from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
-
-        scale_layout = GFX950MXScaleLayout
-    else:
-        scale_layout = StridedLayout
-
-    quant_tensor = quant_tensor.transpose(-2, -1)
-    scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
+    # try:
+    #     from triton_kernels.matmul_ogs import matmul_ogs
+    #     #from triton_kernels.routing import routing
+    #     from triton_kernels.matmul_ogs import PrecisionConfig
+    # except (AttributeError, ImportError) as e:
+    #     logger.error(
+    #         "Failed to import Triton kernels. Please make sure your triton "
+    #         "version is compatible. Error: %s",
+    #         e,
+    #     )
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        mxfp4_quant,
+        moe_gemm_a4w4,
     )
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
-    return quant_tensor, InFlexData(), scale
+
+
+def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1):
+    """weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernel"""
+    # is there any need for layouts or do i just swizzle scales and call it a day
+    # weight and scale passed in
+    # scrap all the layouts and whatever and just implement swizzle basically
+    #assert has_triton_kernels()
+    #from triton_kernels.numerics import InFlexData
+
+    # x: ()
+    # W1: (experts, N, K)
+    # W2: (experts, N, K)
+    # expected W1 for aiter triton matmul: (experts, N, K)
+    # expected W2 for aiter triton matmul: (experts, K, N)
+    w2_triton_layout = w2.transpose(-2, -1)#.contiguous()
+    w2_scale_triton_layout = w2_scale.transpose(-2, -1)
+    # logger.warning("shape")
+    # logger.warning(w1.shape)
+    # logger.warning(w2.shape)
+    # logger.warning(w2_triton_layout.shape)
+    # logger.warning(N_1)
+    # logger.warning(K_1)
+    # logger.warning(N_2)
+    # logger.warning(K_2)
+
+    assert w1.shape[-1] == w2_triton_layout.shape[-2] # check if w1=(N, K), w2_triton_layout=(K,N), and Ks match
+
+    w1, w1_scale = quantize(w1, w_dtype)
+    w2_triton_layout, w2_scale_triton_layout = quantize(w2_triton_layout, w_dtype)
+    w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, K_1 // TP, N_1)
+    w2_scale_triton_layout, swizzle_mx_scale2 = check_and_swizzle_scales(
+        w2_scale_triton_layout, N_2, K_2 // TP // 2
+    )
+
+
+    # from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    # from triton_kernels.tensor_details.layout import StridedLayout
+
+    # value_layout_opts: dict[str, Any] = {}
+    # scale_layout_opts: dict[str, Any] = {}
+    # value_layout = StridedLayout
+    # if get_gfx() == "gfx950":
+    #     from triton_kernels.tensor_details.layout import GFX950MXScaleLayout
+
+    #     scale_layout = GFX950MXScaleLayout
+    # else:
+    #     scale_layout = StridedLayout
+
+    # quant_tensor = quant_tensor.transpose(-2, -1)
+    # scale = scale.transpose(-2, -1)
+    # quant_tensor = convert_layout(
+    #     wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
+    # )
+    # scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
+    return w1, w1_scale, w2_triton_layout, w2_scale_triton_layout # transferring triton layout for now
 
 
 def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
@@ -82,11 +121,16 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     Returns:
         (RoutingData, GatherIndx, ScatterIndx) compatible with triton_kernel_fused_experts
     """
-    from triton_kernels.routing import (
+    # from triton_kernels.routing import (
+    #     RoutingData,
+    #     GatherIndx,
+    #     ScatterIndx,
+    #     compute_expt_data,
+    # )
+    from aiter.ops.triton.moe.moe_routing.routing import (
+        routing,
         RoutingData,
-        GatherIndx,
-        ScatterIndx,
-        compute_expt_data,
+        compute_expt_data_torch,
     )
 
     n_tokens, n_expts_act = topk_weights.shape
@@ -109,12 +153,15 @@ def routing_from_topk(topk_weights, topk_ids, n_expts_tot):
     hist = torch.histc(expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1).int()
 
     # Build routing data structures using triton-accelerated compute_expt_data
-    gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
-    scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
-    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad)
+    # gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
+    # scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
+    m = n_tokens * n_expts_act
+    tokens_per_expt = max(1, m // n_expts_tot)
+    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
+    expt_data = compute_expt_data_torch(hist, n_expts_tot, n_gates_pad, block_m)
 
     routing_data = RoutingData(gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
-    return routing_data, gather_indx, scatter_indx
+    return routing_data, topk_indx, gate_indx#gather_indx, scatter_indx
 
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
@@ -136,8 +183,8 @@ def triton_kernel_moe_forward(
     topk: int,
     renormalize: bool,
     activation: str = "silu",
-    w13_precision_config: PrecisionConfig | None = None,
-    w2_precision_config: PrecisionConfig | None = None,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
@@ -160,8 +207,8 @@ def triton_kernel_moe_forward(
         scatter_idx,
         topk=topk,
         activation=activation,
-        w13_precision_config=w13_precision_config,
-        w2_precision_config=w2_precision_config,
+        w13_scale=w13_scale,
+        w2_scale=w2_scale,
         w1_bias=w1_bias,
         w2_bias=w2_bias,
         apply_router_weight_on_input=apply_router_weight_on_input,
@@ -177,12 +224,12 @@ def triton_kernel_fused_experts(
     w1,  # Tensor or triton_kernels.Tensor
     w2,  # Tensor or triton_kernels.Tensor
     routing_data,  # RoutingData
-    gather_indx,  # GatherIndx
-    scatter_indx,  # ScatterIndx
+    gather_indx,  # GatherIndx -> tensor
+    scatter_indx,  # ScatterIndx -> tensor
     topk: int,
     activation: str = "silu",
-    w13_precision_config: PrecisionConfig | None = None,
-    w2_precision_config: PrecisionConfig | None = None,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
     w1_bias: torch.Tensor | None = None,
     w2_bias: torch.Tensor | None = None,
     swiglu_alpha: float = 1.702,
@@ -201,6 +248,11 @@ def triton_kernel_fused_experts(
     # Shape check, only check non-mxfp4
     assert hidden_states.ndim == 2
     assert hidden_states.shape[-1] == w1.shape[-2]
+    # logger.warning("shape")
+    # logger.warning(hidden_states.shape)
+    # logger.warning(hidden_states.shape[-2:])
+    # logger.warning(w1.shape)
+    # logger.warning(w2.shape)
     assert w2.shape[-1] == w1.shape[1]
 
     batch_dim = 1
@@ -241,33 +293,78 @@ def triton_kernel_fused_experts(
         dtype=hidden_states.dtype,
     )
 
-    matmul_ogs(
-        hidden_states,
-        w1,
+
+    # some scales swizzled in process weights, pull from layer swizzle
+    # w1_scale, swizzle_mx_scale1 = check_and_swizzle_scales(w1_scale, dim2 // 1, dim1) # changed TP to 1
+    # w2_scale, swizzle_mx_scale2 = check_and_swizzle_scales(
+    #     w2_scale, dim1, dim2 // 1 // 2 # changed TP to 1
+    # )
+
+    # matmul_ogs(
+    #     hidden_states,
+    #     w1,
+    #     w1_bias,
+    #     routing_data,
+    #     gather_indx=gather_indx,
+    #     precision_config=w13_precision_config,
+    #     gammas=gammas if apply_router_weight_on_input else None,
+    #     y=raw_intermediate,
+    # )
+
+    x, x_scale = mxfp4_quant(hidden_states)
+
+    raw_intermediate = moe_gemm_a4w4(
+        x,
+        w1, # w1
+        x_scale, # x scale
+        w13_scale, # w1 scale
+        None, # x static scale
+        None, # quant static scale
         w1_bias,
         routing_data,
         gather_indx=gather_indx,
-        precision_config=w13_precision_config,
-        gammas=gammas if apply_router_weight_on_input else None,
-        y=raw_intermediate,
+        swizzle_mx_scale="CDNA4_SCALE", # ?
+        out_dtype=raw_intermediate.dtype,
+        apply_swiglu=True,
     )
+
+    # logger.warning("shape")
+    # logger.warning(raw_intermediate.shape)
 
     # Standard SiLU/SwiGLU activation: silu(gate) * up
-    raw_2d = raw_intermediate.view(M * topk, N)
-    gate = raw_2d[:, :half_N]
-    up = raw_2d[:, half_N:]
-    intermediate_cache[0] = torch.nn.functional.silu(gate) * up
+    # happens in first kernel already -- in triton aiter kernel
+    # raw_2d = raw_intermediate.view(M * topk, N)
+    # gate = raw_2d[:, :half_N]
+    # up = raw_2d[:, half_N:]
+    # intermediate_cache[0] = torch.nn.functional.silu(gate) * up
 
-    matmul_ogs(
-        intermediate_cache.view(M * topk, half_N),
-        w2,
-        w2_bias,
-        routing_data,
+    # matmul_ogs(
+    #     intermediate_cache.view(M * topk, half_N),
+    #     w2,
+    #     w2_bias,
+    #     routing_data,
+    #     scatter_indx=scatter_indx,
+    #     precision_config=w2_precision_config,
+    #     gammas=None if apply_router_weight_on_input else gammas,
+    #     y=output_tensor,
+    # )
+    
+    x, x_scale = mxfp4_quant(raw_intermediate)
+    output_tensor = moe_gemm_a4w4(
+        x, # intermediate_cache.view(M * topk, half_N)
+        w2, # w2
+        x_scale, # x scales
+        w2_scale, # w2 scale
+        None, # x static scale
+        None, # quant static scale
+        w2_bias, # bias
+        routing_data, # routing data
         scatter_indx=scatter_indx,
-        precision_config=w2_precision_config,
-        gammas=None if apply_router_weight_on_input else gammas,
-        y=output_tensor,
+        swizzle_mx_scale="CDNA4_SCALE", # ?
     )
 
-    output_tensor = output_tensor.view(M, K)
+    logger.warning("shape")
+    logger.warning(output_tensor.shape)
+
+    output_tensor = output_tensor.view(M, K) 
     return output_tensor

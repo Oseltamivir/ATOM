@@ -821,31 +821,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            #from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
+            w13_weight, w13_scale, w2_weight, w2_scale = _swizzle_mxfp4(
                 layer.w13_weight.view(torch.uint8),
                 layer.w13_weight_scale,
-            )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
                 layer.w2_weight.view(torch.uint8),
                 layer.w2_weight_scale,
+                "mx4",
+                self.intermediate_size * 2,#N_1, --  FC1
+                self.hidden_size,#K_1,   --  FC1
+                self.hidden_size,#N_2,   --  FC2
+                self.intermediate_size,#K_2,   --  FC2
+                #TP
             )
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
-            )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
+            # self.w13_precision_config = PrecisionConfig(
+            #     weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+            # )
+            # self.w2_precision_config = PrecisionConfig(
+            #     weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+            # )
             del layer.w13_weight
             del layer.w2_weight
             del layer.w13_weight_scale
             del layer.w2_weight_scale
             layer.w13_weight = w13_weight
             layer.w2_weight = w2_weight
-            layer.w13_weight_scale = None
-            layer.w2_weight_scale = None
+            layer.w13_weight_scale = w13_scale
+            layer.w2_weight_scale = w2_scale
             return
         elif layer.activation == ActivationType.Swiglu:
             e, n, k = layer.w13_weight.shape
@@ -990,8 +994,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     scatter_idx,
                     topk=top_k,
                     activation=activation,
-                    w13_precision_config=self.w13_precision_config,
-                    w2_precision_config=self.w2_precision_config,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w13_weight_scale,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
@@ -1012,8 +1016,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 topk=top_k,
                 renormalize=renormalize,
                 activation=activation,
-                w13_precision_config=self.w13_precision_config,
-                w2_precision_config=self.w2_precision_config,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
                 w1_bias=layer.w13_bias,
                 w2_bias=layer.w2_bias,
                 expert_map=expert_map,
