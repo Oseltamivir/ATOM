@@ -78,6 +78,18 @@ def sparse_attn(
                 os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_BLOCK_SIZE", "128")
                 or "128"
             )
+            tile_k = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_TILE_K", "64") or "64"
+            )
+            block_h = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_BLOCK_H", "4") or "4"
+            )
+            block_d = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_BLOCK_D", "128") or "128"
+            )
+            score_d = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_SCORE_D", "64") or "64"
+            )
             q_flat = q.reshape(B * M, H, D).contiguous()
             topk_flat = topk_idxs.reshape(B * M, K).contiguous().int()
             num_blocks = (N + block_size - 1) // block_size
@@ -110,6 +122,10 @@ def sparse_attn(
                 topk_flat,
                 block_table,
                 attn_sink.float().contiguous(),
+                tile_k=tile_k,
+                block_h=block_h,
+                block_d=block_d,
+                score_d=score_d,
             )
             return out.view(B, M, H, D).to(out_dtype)
         except Exception as exc:
