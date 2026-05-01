@@ -1143,6 +1143,28 @@ class Indexer(nn.Module):
             gathered = torch.zeros(
                 1, n_committed, self.head_dim, dtype=q.dtype, device=q.device
             )
+        if n_committed <= 0:
+            return torch.empty(1, seqlen, 0, dtype=torch.int32, device=x.device)
+
+        if os.environ.get("ATOM_DSV4_AITER_INDEXER", "1") == "1" and q.is_cuda:
+            try:
+                from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer_topk
+
+                topk_idxs = dsv4_indexer_topk(
+                    q.squeeze(0),
+                    gathered.squeeze(0),
+                    weights.squeeze(0),
+                    positions,
+                    self.index_topk,
+                    offset,
+                    ratio=ratio,
+                )
+                return topk_idxs.unsqueeze(0)
+            except Exception as exc:
+                if os.environ.get("ATOM_DSV4_AITER_INDEXER_STRICT", "1") == "1":
+                    raise
+                print(f"WARN: AITER DSv4 Indexer failed, falling back to Torch: {exc!r}")
+
         index_score = torch.einsum("bshd,btd->bsht", q, gathered)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
 
@@ -1153,7 +1175,7 @@ class Indexer(nn.Module):
                 >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             )
             index_score = index_score + torch.where(mask, float("-inf"), 0.0)
-        topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
+        topk_idxs = index_score.topk(min(self.index_topk, n_committed), dim=-1)[1]
         if start_pos == 0:
             mask = (
                 topk_idxs

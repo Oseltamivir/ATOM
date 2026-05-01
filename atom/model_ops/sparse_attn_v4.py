@@ -15,6 +15,7 @@ kernel's accumulation precision. They are correct but not performant.
 
 from typing import Tuple
 
+import os
 import torch
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,53 @@ def sparse_attn(
 
     out_dtype = q.dtype
     device = q.device
+
+    if os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN", "1") == "1" and q.is_cuda:
+        try:
+            from aiter.ops.triton.attention.sparse_mqa_sink import sparse_mqa_sink
+
+            block_size = int(
+                os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_BLOCK_SIZE", "128")
+                or "128"
+            )
+            q_flat = q.reshape(B * M, H, D).contiguous()
+            topk_flat = topk_idxs.reshape(B * M, K).contiguous().int()
+            num_blocks = (N + block_size - 1) // block_size
+            padded_n = num_blocks * block_size
+            if padded_n != N:
+                kv_padded = kv.new_zeros((B, padded_n, D))
+                kv_padded[:, :N] = kv
+            else:
+                kv_padded = kv.contiguous()
+            kv_blocks = (
+                kv_padded.view(B, num_blocks, block_size, D)
+                .reshape(B * num_blocks, block_size, D)
+                .contiguous()
+            )
+            block_table = torch.arange(
+                B * num_blocks, device=device, dtype=torch.int32
+            ).view(B, num_blocks)
+            cu_seqlens_q = torch.arange(
+                0, (B + 1) * M, M, device=device, dtype=torch.int32
+            )
+            seqused_k = torch.full((B,), N, device=device, dtype=torch.int32)
+            out = torch.empty_like(q_flat)
+            sparse_mqa_sink(
+                q_flat,
+                kv_blocks,
+                out,
+                cu_seqlens_q,
+                seqused_k,
+                float(softmax_scale),
+                topk_flat,
+                block_table,
+                attn_sink.float().contiguous(),
+            )
+            return out.view(B, M, H, D).to(out_dtype)
+        except Exception as exc:
+            if os.environ.get("ATOM_DSV4_AITER_SPARSE_ATTN_STRICT", "1") == "1":
+                raise
+            print(f"WARN: AITER DSv4 sparse_attn failed, falling back to Torch: {exc!r}")
 
     # ----- Gather KV per query position -----
     # safe_idxs avoids out-of-bounds for the -1 sentinel; we mask the result below.
