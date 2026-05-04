@@ -116,12 +116,25 @@ _V4_DIAG_LAYER_SPEC = os.environ.get(
 _V4_DIAG_TOKEN_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_TOKEN_LIMIT", "4"))
 _V4_DIAG_VERBOSE = os.environ.get("ATOM_DSV4_DIAG_VERBOSE", "0") == "1"
 _V4_DIAG_TOL = float(os.environ.get("ATOM_DSV4_DIAG_TOL", "1e-3"))
+_V4_DEEP_ATTN_DIAG_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_DEEP_ATTN_DIAG_LAYERS", "0"
+)
 
 
 def _v4_diag_layer_enabled(layer_id: int) -> bool:
     if not _V4_DIAG_EQUIV:
         return False
-    spec = _V4_DIAG_LAYER_SPEC.strip().lower()
+    return _v4_diag_layer_in_spec(layer_id, _V4_DIAG_LAYER_SPEC)
+
+
+def _v4_diag_deep_attn_enabled(layer_id: int) -> bool:
+    if not _V4_DIAG_EQUIV:
+        return False
+    return _v4_diag_layer_in_spec(layer_id, _V4_DEEP_ATTN_DIAG_LAYER_SPEC)
+
+
+def _v4_diag_layer_in_spec(layer_id: int, spec_raw: str) -> bool:
+    spec = spec_raw.strip().lower()
     if spec in {"all", "*"}:
         return True
     try:
@@ -198,6 +211,97 @@ def _v4_diag_check_equiv(
             )
     except Exception as exc:
         print(f"[DSv4 diag] {label}: check failed: {exc!r}", flush=True)
+
+
+def _v4_diag_check_flat_topk(
+    label: str,
+    topk_flat: torch.Tensor,
+    topk_lens: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    """Check row-wise top-k equivalence when the diagnostic batch has uniform K."""
+    batch = _v4_diag_get_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    if topk_lens.size(0) < total:
+        return
+    try:
+        lens = topk_lens[:total].detach()
+        min_len = int(lens.min().item())
+        max_len = int(lens.max().item())
+        if min_len != max_len:
+            print(
+                "[DSv4 diag] "
+                f"{label}: skipped nonuniform topk_lens min={min_len} max={max_len}",
+                flush=True,
+            )
+            return
+        needed = total * max_len
+        if max_len <= 0 or topk_flat.numel() < needed:
+            return
+        rows = topk_flat[:needed].reshape(total, max_len)
+        _v4_diag_check_equiv(label, rows, input_ids)
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}: topk check failed: {exc!r}", flush=True)
+
+
+def _v4_diag_check_packed_kv(
+    label: str,
+    kv_flat: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    """Check equivalence of per-sequence packed KV slices.
+
+    `kv_flat` is sequence-concatenated, not token-major. For identical fresh
+    prefill probes, every sequence should have an equal-length packed slice.
+    """
+    batch = _v4_diag_get_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    if kv_offsets.size(0) < total:
+        return
+    try:
+        starts = []
+        for seq_idx in range(bs):
+            starts.append(int(kv_offsets[seq_idx * seqlen].item()))
+        lengths = [
+            (starts[i + 1] - starts[i]) if i + 1 < bs else (kv_flat.size(0) - starts[i])
+            for i in range(bs)
+        ]
+        if not lengths or min(lengths) <= 0 or len(set(lengths)) != 1:
+            print(
+                "[DSv4 diag] "
+                f"{label}: skipped nonuniform kv slice lengths={lengths[:8]}",
+                flush=True,
+            )
+            return
+        kv_len = lengths[0]
+        view = torch.stack(
+            [kv_flat[start : start + kv_len] for start in starts],
+            dim=0,
+        ).reshape(bs, kv_len, -1)
+        toks = _v4_diag_selected_tokens(kv_len)
+        selected = view.index_select(
+            1, torch.tensor(toks, dtype=torch.long, device=kv_flat.device)
+        )
+        ref = selected[0:1].float()
+        diff = (selected.float() - ref).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int((diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item())
+        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
+            print(
+                "[DSv4 diag] "
+                f"{label}: bs={bs} kv_len={kv_len} toks={toks} "
+                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{bs}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}: kv pack check failed: {exc!r}", flush=True)
 
 
 def _v4_diag_check_logits(label: str, logits: torch.Tensor) -> None:
@@ -1653,6 +1757,7 @@ class DeepseekV4Attention(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
+        input_ids: Optional[torch.Tensor] = None,  # diagnostic equivalence only
     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
         """Compute attention for `x` at absolute token `positions`.
 
@@ -1669,6 +1774,13 @@ class DeepseekV4Attention(nn.Module):
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
+        deep_diag = _v4_diag_deep_attn_enabled(self.layer_id)
+        diag_prefix = f"L{self.layer_id}.attn"
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.input_normed", x, input_ids)
+            _v4_diag_check_equiv(
+                f"{diag_prefix}.positions", positions.unsqueeze(-1), input_ids
+            )
 
         # Idempotent one-time plumb of rotary_emb into compressor / indexer
         # (and the indexer's inner compressor). `rotary_emb` is set by the
@@ -1688,19 +1800,37 @@ class DeepseekV4Attention(nn.Module):
             act_quant_inplace(x, 128, "ue8m0")
         # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
         qkv_a = self.wqkv_a(x)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.qkv_a", qkv_a, input_ids)
         q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.q_lora", q_lora, input_ids)
+            _v4_diag_check_equiv(f"{diag_prefix}.kv_pre", kv_pre, input_ids)
         qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.qr_norm", qr, input_ids)
         if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
             act_quant_inplace(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.q_proj", q, input_ids)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.q_head_norm", q, input_ids)
         # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
         # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
         kv = self.kv_norm(kv_pre)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.kv_norm", kv, input_ids)
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.q_post_rope", q, input_ids)
+            _v4_diag_check_equiv(f"{diag_prefix}.kv_post_rope", kv, input_ids)
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
+            if deep_diag:
+                _v4_diag_check_equiv(f"{diag_prefix}.kv_post_quant", kv, input_ids)
         # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
         # All per-fwd state read once. Production prepare_decode/prefill
         # always populates these; warmup goes through the same path
@@ -1756,6 +1886,10 @@ class DeepseekV4Attention(nn.Module):
                 qr_full=qr,
                 positions=positions,
             )
+            if deep_diag:
+                _v4_diag_check_equiv(
+                    f"{diag_prefix}.indexer_topk", indexer_topk_batched, input_ids
+                )
             # Phase C: build CSA paged-compress section in
             # `v4_kv_indices_csa` (window prefix already filled by Phase B).
             # Layer-local because indexer output differs per layer; consumed by
@@ -1791,6 +1925,14 @@ class DeepseekV4Attention(nn.Module):
         # CG-friendly. Otherwise fall back to ragged_varlen for prefill /
         # mixed batches.
         q_sa = q.contiguous()
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.q_sa", q_sa, input_ids)
+            if window_topk_batched is not None:
+                _v4_diag_check_equiv(
+                    f"{diag_prefix}.window_topk",
+                    window_topk_batched,
+                    input_ids,
+                )
         if attn_md.is_pure_decode:
             from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
 
@@ -1811,6 +1953,8 @@ class DeepseekV4Attention(nn.Module):
                 self.attn_sink,
                 self.softmax_scale,
             )  # [S, H, head_dim]
+            if deep_diag:
+                _v4_diag_check_equiv(f"{diag_prefix}.paged_decode_raw", o, input_ids)
         else:
             # Pre-built `pack_meta` (built once in `_build_v4_pack_meta_for_ratio`)
             # carries every CPU/GPU index — the per-layer call is just GPU
@@ -1832,6 +1976,24 @@ class DeepseekV4Attention(nn.Module):
             topk_lens = layout["topk_lens"]
             kv_offsets = layout["kv_offsets"]
             max_topk = layout["max_topk"]
+            if deep_diag:
+                _v4_diag_check_equiv(
+                    f"{diag_prefix}.topk_lens",
+                    topk_lens.unsqueeze(-1),
+                    input_ids,
+                )
+                _v4_diag_check_flat_topk(
+                    f"{diag_prefix}.topk_flat",
+                    topk_flat,
+                    topk_lens,
+                    input_ids,
+                )
+                _v4_diag_check_packed_kv(
+                    f"{diag_prefix}.kv_sa",
+                    kv_sa,
+                    kv_offsets,
+                    input_ids,
+                )
             o = sparse_attn_ragged_varlen(
                 q_sa,
                 kv_sa,
@@ -1843,6 +2005,10 @@ class DeepseekV4Attention(nn.Module):
                 max_topk,
                 self.softmax_scale,
             )  # [S, H, head_dim]
+            if deep_diag:
+                _v4_diag_check_equiv(
+                    f"{diag_prefix}.ragged_attn_raw", o, input_ids
+                )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
@@ -1853,11 +2019,19 @@ class DeepseekV4Attention(nn.Module):
         # over B and H. In-place writes hit the underlying storage.
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o.unsqueeze(0)[..., -rd:], freqs_slice, inverse=True)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.inverse_rope", o, input_ids)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(seqlen_total, self.n_local_groups, -1)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.group_view", o, input_ids)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.wo_a", o, input_ids)
         x = self.wo_b(o.flatten(1))
+        if deep_diag:
+            _v4_diag_check_equiv(f"{diag_prefix}.wo_b", x, input_ids)
         return x
 
     def _fill_csa_paged_compress(self, attn_md, total_tokens: int) -> None:
@@ -2389,7 +2563,7 @@ class Block(nn.Module):
         if diag:
             _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_pre", x, input_ids)
         x = self.attn_norm(x)  # [num_tokens, dim]
-        x = self.attn(x, positions)  # [num_tokens, dim]
+        x = self.attn(x, positions, input_ids=input_ids)  # [num_tokens, dim]
         if diag:
             _v4_diag_check_equiv(f"L{self.layer_id}.attn_out", x, input_ids)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
