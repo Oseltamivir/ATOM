@@ -1607,15 +1607,23 @@ class DeepseekV4Attention(nn.Module):
         self.attn_sink = atom_parameter(
             torch.empty(self.n_local_heads, dtype=torch.float32)
         )
-        # Fused [wq_a; wkv]: both ReplicatedLinear FP8 sharing input x.
-        # On disk still split (`attn.wq_a.{weight,scale}` + `attn.wkv.{weight,scale}`);
-        # routed via packed_modules_mapping in DeepseekV4ForCausalLM.
-        self.wqkv_a = MergedReplicatedLinear(
+        # Keep wq_a and wkv as separate FP8 blockscale GEMMs. A fused
+        # [wq_a; wkv] projection creates a DSv4-Pro shape
+        # (N=2048,K=7168) that is not covered by AITER's MI355X tuned table and
+        # showed batch-size-dependent drift at higher concurrencies.
+        self.wq_a = ReplicatedLinear(
             self.dim,
-            [self.q_lora_rank, self.head_dim],
+            self.q_lora_rank,
             bias=False,
             quant_config=qc,
-            prefix=f"{p}.wqkv_a",
+            prefix=f"{p}.wq_a",
+        )
+        self.wkv = ReplicatedLinear(
+            self.dim,
+            self.head_dim,
+            bias=False,
+            quant_config=qc,
+            prefix=f"{p}.wkv",
         )
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = ColumnParallelLinear(
@@ -1798,12 +1806,14 @@ class DeepseekV4Attention(nn.Module):
         if _V4_FORCE_UE8M0_QUANT:
             x = x.clone()
             act_quant_inplace(x, 128, "ue8m0")
-        # Single fused FP8 GEMM for [wq_a; wkv]; torch.split returns zero-copy views.
-        qkv_a = self.wqkv_a(x)
+        q_lora = self.wq_a(x)
+        kv_pre = self.wkv(x)
         if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.qkv_a", qkv_a, input_ids)
-        q_lora, kv_pre = torch.split(qkv_a, [self.q_lora_rank, self.head_dim], dim=-1)
-        if deep_diag:
+            _v4_diag_check_equiv(
+                f"{diag_prefix}.qkv_a_split",
+                torch.cat((q_lora, kv_pre), dim=-1),
+                input_ids,
+            )
             _v4_diag_check_equiv(f"{diag_prefix}.q_lora", q_lora, input_ids)
             _v4_diag_check_equiv(f"{diag_prefix}.kv_pre", kv_pre, input_ids)
         qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
@@ -2894,8 +2904,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         ".scale": ".weight_scale_inv",
     }
     packed_modules_mapping = {
-        "attn.wq_a": ("attn.wqkv_a", 0),
-        "attn.wkv": ("attn.wqkv_a", 1),
         "compressor.wkv": ("compressor.wkv_gate", 0),
         "compressor.wgate": ("compressor.wkv_gate", 1),
         "shared_experts.w1": ("shared_experts.gate_up_proj", 0),
