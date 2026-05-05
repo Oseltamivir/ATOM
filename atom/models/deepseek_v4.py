@@ -65,6 +65,7 @@ from atom.model_ops.quant_v4 import (
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import (
+    _sparse_attn_ragged_torch,
     hc_split_sinkhorn,
     sparse_attn_ragged_varlen,
 )
@@ -116,9 +117,11 @@ _V4_DIAG_LAYER_SPEC = os.environ.get(
 _V4_DIAG_TOKEN_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_TOKEN_LIMIT", "4"))
 _V4_DIAG_VERBOSE = os.environ.get("ATOM_DSV4_DIAG_VERBOSE", "0") == "1"
 _V4_DIAG_TOL = float(os.environ.get("ATOM_DSV4_DIAG_TOL", "1e-3"))
+_V4_DIAG_FULL_SEQ_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_FULL_SEQ_LIMIT", "0"))
 _V4_DEEP_ATTN_DIAG_LAYER_SPEC = os.environ.get(
     "ATOM_DSV4_DEEP_ATTN_DIAG_LAYERS", "0"
 )
+_V4_DEEP_ATTN_REF_DIAG = os.environ.get("ATOM_DSV4_DEEP_ATTN_REF_DIAG", "0") == "1"
 
 
 def _v4_diag_layer_enabled(layer_id: int) -> bool:
@@ -213,11 +216,66 @@ def _v4_diag_check_equiv(
         print(f"[DSv4 diag] {label}: check failed: {exc!r}", flush=True)
 
 
+def _v4_diag_check_equiv_full_short(
+    label: str,
+    tensor: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    """Check all token rows for short identical diagnostic batches.
+
+    Sparse attention at one sampled query can consume many unsampled KV rows.
+    This catches hidden drift in those rows before blaming the attention
+    kernel.
+    """
+    if _V4_DIAG_FULL_SEQ_LIMIT <= 0:
+        return
+    batch = _v4_diag_get_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    if seqlen > _V4_DIAG_FULL_SEQ_LIMIT or tensor.size(0) < total:
+        return
+    try:
+        view = tensor[:total].detach().reshape(bs, seqlen, -1)
+        ref = view[0:1]
+        neq = view != ref
+        bad_tokens = neq.any(dim=2)
+        bad_rows = int(bad_tokens.any(dim=1).sum().item())
+        if bad_rows == 0:
+            if _V4_DIAG_VERBOSE:
+                print(
+                    "[DSv4 diag] "
+                    f"{label}.full: bs={bs} seqlen={seqlen} max_abs=0 "
+                    f"mean_abs=0 bad_rows=0/{bs}",
+                    flush=True,
+                )
+            return
+        diff = (view.float() - ref.float()).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_pos = bad_tokens.nonzero()
+        first_bad = (
+            (int(bad_pos[0, 0].item()), int(bad_pos[0, 1].item()))
+            if bad_pos.numel()
+            else (-1, -1)
+        )
+        print(
+            "[DSv4 diag] "
+            f"{label}.full: bs={bs} seqlen={seqlen} max_abs={max_abs:.6g} "
+            f"mean_abs={mean_abs:.6g} bad_rows={bad_rows}/{bs} "
+            f"first_bad_seq_tok={first_bad}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}.full: check failed: {exc!r}", flush=True)
+
+
 def _v4_diag_check_flat_topk(
     label: str,
     topk_flat: torch.Tensor,
     topk_lens: torch.Tensor,
     input_ids: Optional[torch.Tensor],
+    topk_starts: Optional[torch.Tensor] = None,
 ) -> None:
     """Check row-wise top-k equivalence when the diagnostic batch has uniform K."""
     batch = _v4_diag_get_equal_batch(input_ids)
@@ -240,8 +298,36 @@ def _v4_diag_check_flat_topk(
         needed = total * max_len
         if max_len <= 0 or topk_flat.numel() < needed:
             return
-        rows = topk_flat[:needed].reshape(total, max_len)
-        _v4_diag_check_equiv(label, rows, input_ids)
+        if topk_starts is None:
+            rows = topk_flat[:needed].reshape(total, max_len)
+            _v4_diag_check_equiv(label, rows, input_ids)
+            return
+        toks = _v4_diag_selected_tokens(seqlen)
+        flat_rows = torch.tensor(
+            [seq * seqlen + tok for seq in range(bs) for tok in toks],
+            dtype=torch.long,
+            device=topk_flat.device,
+        )
+        starts = topk_starts.index_select(0, flat_rows).long()
+        cols = torch.arange(max_len, dtype=torch.long, device=topk_flat.device)
+        rows = topk_flat[(starts.unsqueeze(1) + cols).reshape(-1)].reshape(
+            bs, len(toks), max_len
+        )
+        ref = rows[0:1].float()
+        diff = (rows.float() - ref).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int(
+            (diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item()
+        )
+        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
+            print(
+                "[DSv4 diag] "
+                f"{label}: bs={bs} seqlen={seqlen} toks={toks} "
+                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{bs}",
+                flush=True,
+            )
     except Exception as exc:
         print(f"[DSv4 diag] {label}: topk check failed: {exc!r}", flush=True)
 
@@ -300,8 +386,108 @@ def _v4_diag_check_packed_kv(
                 f"bad_rows={bad_rows}/{bs}",
                 flush=True,
             )
+        if _V4_DIAG_FULL_SEQ_LIMIT > 0 and kv_len <= _V4_DIAG_FULL_SEQ_LIMIT:
+            ref_full = view[0:1]
+            neq = view != ref_full
+            bad_tokens = neq.any(dim=2)
+            bad_rows_full = int(bad_tokens.any(dim=1).sum().item())
+            if bad_rows_full == 0:
+                if _V4_DIAG_VERBOSE:
+                    print(
+                        "[DSv4 diag] "
+                        f"{label}.full: bs={bs} kv_len={kv_len} max_abs=0 "
+                        f"mean_abs=0 bad_rows=0/{bs}",
+                        flush=True,
+                    )
+            else:
+                diff_full = (view.float() - ref_full.float()).abs()
+                bad_pos = bad_tokens.nonzero()
+                first_bad = (
+                    (int(bad_pos[0, 0].item()), int(bad_pos[0, 1].item()))
+                    if bad_pos.numel()
+                    else (-1, -1)
+                )
+                print(
+                    "[DSv4 diag] "
+                    f"{label}.full: bs={bs} kv_len={kv_len} "
+                    f"max_abs={float(diff_full.max().item()):.6g} "
+                    f"mean_abs={float(diff_full.mean().item()):.6g} "
+                    f"bad_rows={bad_rows_full}/{bs} first_bad_seq_pos={first_bad}",
+                    flush=True,
+                )
     except Exception as exc:
         print(f"[DSv4 diag] {label}: kv pack check failed: {exc!r}", flush=True)
+
+
+def _v4_diag_compare_ragged_attn_ref(
+    label: str,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_flat: torch.Tensor,
+    topk_starts: torch.Tensor,
+    topk_lens: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    max_topk: int,
+    softmax_scale: float,
+    out: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    """Compare Triton ragged attention output against the torch reference."""
+    if not _V4_DEEP_ATTN_REF_DIAG:
+        return
+    batch = _v4_diag_get_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    if q.size(0) < total or out.size(0) < total or topk_lens.size(0) < total:
+        return
+    try:
+        toks = _v4_diag_selected_tokens(seqlen)
+        flat_rows = torch.tensor(
+            [seq * seqlen + tok for seq in range(bs) for tok in toks],
+            dtype=torch.long,
+            device=q.device,
+        )
+        q_sel = q.index_select(0, flat_rows)
+        out_sel = out.index_select(0, flat_rows)
+        lens = topk_lens.index_select(0, flat_rows).to(torch.int64)
+        starts = topk_starts.index_select(0, flat_rows).to(torch.int64)
+        offsets = kv_offsets.index_select(0, flat_rows).to(torch.int32)
+        k_width = min(int(max_topk), int(lens.max().item()))
+        topk_idxs = torch.full(
+            (flat_rows.numel(), k_width), -1, dtype=torch.int32, device=q.device
+        )
+        for row in range(flat_rows.numel()):
+            length = min(int(lens[row].item()), k_width)
+            if length <= 0:
+                continue
+            local = topk_flat.narrow(0, int(starts[row].item()), length).to(
+                torch.int32
+            )
+            topk_idxs[row, :length] = torch.where(
+                local >= 0, local + offsets[row], local
+            )
+        ref = _sparse_attn_ragged_torch(
+            q_sel, kv, attn_sink, topk_idxs, float(softmax_scale)
+        )
+        diff = (out_sel.float() - ref.float()).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int(
+            (diff.reshape(flat_rows.numel(), -1).amax(dim=1) > _V4_DIAG_TOL)
+            .sum()
+            .item()
+        )
+        print(
+            "[DSv4 diag] "
+            f"{label}.torch_ref: rows={flat_rows.numel()} toks={toks} "
+            f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+            f"bad_rows={bad_rows}/{flat_rows.numel()}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}.torch_ref: check failed: {exc!r}", flush=True)
 
 
 def _v4_diag_check_logits(label: str, logits: torch.Tensor) -> None:
@@ -1937,6 +2123,9 @@ class DeepseekV4Attention(nn.Module):
         q_sa = q.contiguous()
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.q_sa", q_sa, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.q_sa", q_sa, input_ids
+            )
             if window_topk_batched is not None:
                 _v4_diag_check_equiv(
                     f"{diag_prefix}.window_topk",
@@ -1997,6 +2186,7 @@ class DeepseekV4Attention(nn.Module):
                     topk_flat,
                     topk_lens,
                     input_ids,
+                    topk_starts,
                 )
                 _v4_diag_check_packed_kv(
                     f"{diag_prefix}.kv_sa",
@@ -2016,6 +2206,20 @@ class DeepseekV4Attention(nn.Module):
                 self.softmax_scale,
             )  # [S, H, head_dim]
             if deep_diag:
+                _v4_diag_compare_ragged_attn_ref(
+                    f"{diag_prefix}.ragged_attn_raw",
+                    q_sa,
+                    kv_sa,
+                    self.attn_sink,
+                    topk_flat,
+                    topk_starts,
+                    topk_lens,
+                    kv_offsets,
+                    max_topk,
+                    self.softmax_scale,
+                    o,
+                    input_ids,
+                )
                 _v4_diag_check_equiv(
                     f"{diag_prefix}.ragged_attn_raw", o, input_ids
                 )
