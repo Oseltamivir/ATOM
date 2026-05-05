@@ -1972,6 +1972,9 @@ class DeepseekV4Attention(nn.Module):
         diag_prefix = f"L{self.layer_id}.attn"
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.input_normed", x, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.input_normed", x, input_ids
+            )
             _v4_diag_check_equiv(
                 f"{diag_prefix}.positions", positions.unsqueeze(-1), input_ids
             )
@@ -2001,28 +2004,46 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
             )
             _v4_diag_check_equiv(f"{diag_prefix}.q_lora", q_lora, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.q_lora", q_lora, input_ids
+            )
             _v4_diag_check_equiv(f"{diag_prefix}.kv_pre", kv_pre, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.kv_pre", kv_pre, input_ids
+            )
         qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.qr_norm", qr, input_ids)
+            _v4_diag_check_equiv_full_short(f"{diag_prefix}.qr_norm", qr, input_ids)
         if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
             act_quant_inplace(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.q_proj", q, input_ids)
+            _v4_diag_check_equiv_full_short(f"{diag_prefix}.q_proj", q, input_ids)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.q_head_norm", q, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.q_head_norm", q, input_ids
+            )
         # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
         # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
         kv = self.kv_norm(kv_pre)
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.kv_norm", kv, input_ids)
+            _v4_diag_check_equiv_full_short(f"{diag_prefix}.kv_norm", kv, input_ids)
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.q_post_rope", q, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.q_post_rope", q, input_ids
+            )
             _v4_diag_check_equiv(f"{diag_prefix}.kv_post_rope", kv, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{diag_prefix}.kv_post_rope", kv, input_ids
+            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
             if deep_diag:
@@ -2776,6 +2797,10 @@ class Block(nn.Module):
         )
         if diag:
             _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_pre", x, input_ids)
+            if _v4_diag_deep_attn_enabled(self.layer_id):
+                _v4_diag_check_equiv_full_short(
+                    f"L{self.layer_id}.attn_hc_pre", x, input_ids
+                )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions, input_ids=input_ids)  # [num_tokens, dim]
         if diag:
