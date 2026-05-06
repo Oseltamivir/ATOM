@@ -56,7 +56,6 @@ from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
-    gemm_a8w8_blockscale_preshuffle_impl,
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
     ReplicatedLinear,
@@ -69,7 +68,6 @@ from atom.model_ops.quant_v4 import (
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import (
-    _sparse_attn_ragged_torch,
     hc_split_sinkhorn,
     sparse_attn_ragged_varlen,
 )
@@ -114,171 +112,10 @@ _V4_USE_TRITON_RMSNORM = _V4_RMSNORM_BACKEND == "triton"
 # forward burns syscalls (V4-Pro: 64 layers × multiple sites per call).
 _V4_FORCE_UE8M0_QUANT = os.environ.get("V4_FORCE_UE8M0_QUANT", "0") == "1"
 _V4_USE_REF_QUANT = os.environ.get("V4_USE_REF_QUANT", "0") == "1"
-_V4_DIAG_EQUIV = os.environ.get("ATOM_DSV4_DIAG_EQUIV", "0") == "1"
-_V4_DIAG_LAYER_SPEC = os.environ.get(
-    "ATOM_DSV4_DIAG_LAYERS", "0,1,2,3,31,63"
-)
-_V4_DIAG_TOKEN_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_TOKEN_LIMIT", "4"))
-_V4_DIAG_VERBOSE = os.environ.get("ATOM_DSV4_DIAG_VERBOSE", "0") == "1"
-_V4_DIAG_TOL = float(os.environ.get("ATOM_DSV4_DIAG_TOL", "1e-3"))
-_V4_DIAG_FULL_SEQ_LIMIT = int(os.environ.get("ATOM_DSV4_DIAG_FULL_SEQ_LIMIT", "0"))
-_V4_DEEP_ATTN_DIAG_LAYER_SPEC = os.environ.get(
-    "ATOM_DSV4_DEEP_ATTN_DIAG_LAYERS", "0"
-)
-_V4_DEEP_ATTN_REF_DIAG = os.environ.get("ATOM_DSV4_DEEP_ATTN_REF_DIAG", "0") == "1"
 _V4_TP_REDUCE_BACKEND = os.environ.get(
     "ATOM_DSV4_TP_REDUCE_BACKEND",
     os.environ.get("ATOM_DSV4_WO_B_REDUCE_BACKEND", "aiter"),
 ).lower()
-_V4_DIAG_COMPARE_WO_B_REDUCE = (
-    os.environ.get("ATOM_DSV4_DIAG_COMPARE_WO_B_REDUCE", "1") == "1"
-)
-
-
-def _v4_diag_layer_enabled(layer_id: int) -> bool:
-    if not _V4_DIAG_EQUIV:
-        return False
-    return _v4_diag_layer_in_spec(layer_id, _V4_DIAG_LAYER_SPEC)
-
-
-def _v4_diag_deep_attn_enabled(layer_id: int) -> bool:
-    if not _V4_DIAG_EQUIV:
-        return False
-    return _v4_diag_layer_in_spec(layer_id, _V4_DEEP_ATTN_DIAG_LAYER_SPEC)
-
-
-def _v4_diag_layer_in_spec(layer_id: int, spec_raw: str) -> bool:
-    spec = spec_raw.strip().lower()
-    if spec in {"all", "*"}:
-        return True
-    try:
-        return layer_id in {int(x) for x in spec.split(",") if x.strip()}
-    except ValueError:
-        return False
-
-
-def _v4_diag_get_equal_batch(input_ids: Optional[torch.Tensor]):
-    if not _V4_DIAG_EQUIV or input_ids is None:
-        return None
-    try:
-        ctx = get_forward_context()
-        attn_md = ctx.attn_metadata if ctx is not None else None
-        cu = getattr(attn_md, "cu_seqlens_q_cpu", None)
-        if cu is None or attn_md is None or attn_md.block_tables is None:
-            return None
-        bs = int(attn_md.block_tables.size(0))
-        if bs < 2 or len(cu) < bs + 1:
-            return None
-        lens = [int(cu[i + 1] - cu[i]) for i in range(bs)]
-        if not lens or len(set(lens)) != 1 or lens[0] <= 0:
-            return None
-        seqlen = lens[0]
-        total = bs * seqlen
-        if input_ids.numel() < total:
-            return None
-        ids = input_ids[:total].reshape(bs, seqlen)
-        if not bool((ids == ids[0:1]).all().item()):
-            return None
-        return bs, seqlen, total
-    except Exception as exc:
-        print(f"[DSv4 diag] equiv setup skipped: {exc!r}", flush=True)
-        return None
-
-
-def _v4_diag_selected_tokens(seqlen: int) -> list[int]:
-    if seqlen <= 0:
-        return []
-    base = [0, seqlen // 2, seqlen - 1]
-    if _V4_DIAG_TOKEN_LIMIT > 3:
-        base.extend(range(min(seqlen, _V4_DIAG_TOKEN_LIMIT - 3)))
-    return sorted(set(i for i in base if 0 <= i < seqlen))
-
-
-def _v4_diag_check_equiv(
-    label: str,
-    tensor: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-) -> None:
-    batch = _v4_diag_get_equal_batch(input_ids)
-    if batch is None:
-        return
-    bs, seqlen, total = batch
-    if tensor.size(0) < total:
-        return
-    try:
-        toks = _v4_diag_selected_tokens(seqlen)
-        view = tensor[:total].detach().reshape(bs, seqlen, -1).index_select(
-            1, torch.tensor(toks, dtype=torch.long, device=tensor.device)
-        )
-        ref = view[0:1].float()
-        diff = (view.float() - ref).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int((diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item())
-        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
-            print(
-                "[DSv4 diag] "
-                f"{label}: bs={bs} seqlen={seqlen} toks={toks} "
-                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-                f"bad_rows={bad_rows}/{bs}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}: check failed: {exc!r}", flush=True)
-
-
-def _v4_diag_check_equiv_full_short(
-    label: str,
-    tensor: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-) -> None:
-    """Check all token rows for short identical diagnostic batches.
-
-    Sparse attention at one sampled query can consume many unsampled KV rows.
-    This catches hidden drift in those rows before blaming the attention
-    kernel.
-    """
-    if _V4_DIAG_FULL_SEQ_LIMIT <= 0:
-        return
-    batch = _v4_diag_get_equal_batch(input_ids)
-    if batch is None:
-        return
-    bs, seqlen, total = batch
-    if seqlen > _V4_DIAG_FULL_SEQ_LIMIT or tensor.size(0) < total:
-        return
-    try:
-        view = tensor[:total].detach().reshape(bs, seqlen, -1)
-        ref = view[0:1]
-        neq = view != ref
-        bad_tokens = neq.any(dim=2)
-        bad_rows = int(bad_tokens.any(dim=1).sum().item())
-        if bad_rows == 0:
-            if _V4_DIAG_VERBOSE:
-                print(
-                    "[DSv4 diag] "
-                    f"{label}.full: bs={bs} seqlen={seqlen} max_abs=0 "
-                    f"mean_abs=0 bad_rows=0/{bs}",
-                    flush=True,
-                )
-            return
-        diff = (view.float() - ref.float()).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_pos = bad_tokens.nonzero()
-        first_bad = (
-            (int(bad_pos[0, 0].item()), int(bad_pos[0, 1].item()))
-            if bad_pos.numel()
-            else (-1, -1)
-        )
-        print(
-            "[DSv4 diag] "
-            f"{label}.full: bs={bs} seqlen={seqlen} max_abs={max_abs:.6g} "
-            f"mean_abs={mean_abs:.6g} bad_rows={bad_rows}/{bs} "
-            f"first_bad_seq_tok={first_bad}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}.full: check failed: {exc!r}", flush=True)
 
 
 def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -287,374 +124,19 @@ def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _v4_diag_compare_reduce(
-    label: str,
-    actual: torch.Tensor,
-    ref: torch.Tensor,
-) -> None:
-    if not _V4_DIAG_EQUIV:
-        return
+def _v4_row_parallel_linear(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    if _V4_TP_REDUCE_BACKEND != "torch":
+        return layer(x)
+
+    reduce_results = layer.reduce_results
+    layer.reduce_results = False
     try:
-        diff = (actual.float() - ref.float()).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int(
-            (diff.reshape(diff.size(0), -1).amax(dim=1) > _V4_DIAG_TOL)
-            .sum()
-            .item()
-        )
-        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
-            print(
-                "[DSv4 diag] "
-                f"{label}: max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-                f"bad_rows={bad_rows}/{diff.size(0)}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}: reduce compare failed: {exc!r}", flush=True)
-
-
-def _v4_diag_wo_b_staged(
-    layer: RowParallelLinear,
-    x: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-    diag_prefix: str,
-) -> torch.Tensor:
-    """Run attention wo_b with diagnostics around quant, GEMM, and TP reduce."""
-    label = f"{diag_prefix}.wo_b"
-    _v4_diag_check_equiv(f"{label}.input", x, input_ids)
-    _v4_diag_check_equiv_full_short(f"{label}.input", x, input_ids)
-    try:
-        if layer.quant_type.value != aiter.QuantType.per_1x128.value:
-            print(
-                "[DSv4 diag] "
-                f"{label}: staged path skipped for quant_type={layer.quant_type}",
-                flush=True,
-            )
-            y = layer(x)
-            _v4_diag_check_equiv(f"{label}.post_reduce", y, input_ids)
-            return y
-
-        qx, x_scale = layer.quant_func(
-            x,
-            quant_dtype=layer.params_dtype,
-            scale=getattr(layer, "input_scale", None),
-            transpose_scale=True,
-        )
-        if _V4_DIAG_VERBOSE:
-            print(
-                "[DSv4 diag] "
-                f"{label}.meta: "
-                f"x={tuple(x.shape)} {x.dtype} "
-                f"qx={tuple(qx.shape)} {qx.dtype} "
-                f"x_scale={tuple(x_scale.shape)} {x_scale.dtype} "
-                f"w={tuple(layer.weight.shape)} {layer.weight.dtype} "
-                f"w_scale={tuple(layer.weight_scale.shape)} "
-                f"{layer.weight_scale.dtype} "
-                f"tp_dim={layer.tp_dim} tp_size={layer.tp_size} "
-                f"reduce={layer.reduce_results}",
-                flush=True,
-            )
-        _v4_diag_check_equiv(f"{label}.qx", qx, input_ids)
-        _v4_diag_check_equiv_full_short(f"{label}.qx", qx, input_ids)
-        _v4_diag_check_equiv(f"{label}.x_scale", x_scale, input_ids)
-        _v4_diag_check_equiv_full_short(f"{label}.x_scale", x_scale, input_ids)
-
-        y_local = gemm_a8w8_blockscale_preshuffle_impl(
-            qx,
-            layer.weight,
-            x_scale,
-            layer.weight_scale,
-            dtype=dtypes.bf16,
-            prefix=layer.prefix,
-        )
-        if layer.bias is not None:
-            y_local += layer.bias
-        _v4_diag_check_equiv(f"{label}.local_gemm", y_local, input_ids)
-        _v4_diag_check_equiv_full_short(f"{label}.local_gemm", y_local, input_ids)
-
-        if layer.tp_dim == 1 and layer.tp_size > 1 and layer.reduce_results:
-            y_before_reduce = y_local.clone()
-            if _V4_TP_REDUCE_BACKEND == "torch":
-                y_reduced = _v4_torch_tp_all_reduce(y_before_reduce)
-                if _V4_DIAG_VERBOSE:
-                    print(
-                        "[DSv4 diag] "
-                        f"{label}.reduce_backend=torch",
-                        flush=True,
-                    )
-            else:
-                y_reduced = get_tp_group().all_reduce(y_local, ca_fp8_quant=False)
-                if _V4_DIAG_COMPARE_WO_B_REDUCE:
-                    y_torch = _v4_torch_tp_all_reduce(y_before_reduce)
-                    _v4_diag_compare_reduce(
-                        f"{label}.aiter_vs_torch_reduce", y_reduced, y_torch
-                    )
-                    _v4_diag_check_equiv(
-                        f"{label}.torch_reduce", y_torch, input_ids
-                    )
-                    _v4_diag_check_equiv_full_short(
-                        f"{label}.torch_reduce", y_torch, input_ids
-                    )
-            _v4_diag_check_equiv(f"{label}.post_reduce", y_reduced, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{label}.post_reduce", y_reduced, input_ids
-            )
-            _v4_diag_check_equiv(
-                f"{label}.reduce_delta", y_reduced - y_before_reduce, input_ids
-            )
-            return y_reduced
-
-        _v4_diag_check_equiv(f"{label}.post_reduce", y_local, input_ids)
-        return y_local
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}.staged: failed: {exc!r}", flush=True)
         y = layer(x)
-        _v4_diag_check_equiv(f"{label}.fallback", y, input_ids)
-        return y
-
-
-def _v4_diag_check_flat_topk(
-    label: str,
-    topk_flat: torch.Tensor,
-    topk_lens: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-    topk_starts: Optional[torch.Tensor] = None,
-) -> None:
-    """Check row-wise top-k equivalence when the diagnostic batch has uniform K."""
-    batch = _v4_diag_get_equal_batch(input_ids)
-    if batch is None:
-        return
-    bs, seqlen, total = batch
-    if topk_lens.size(0) < total:
-        return
-    try:
-        lens = topk_lens[:total].detach()
-        min_len = int(lens.min().item())
-        max_len = int(lens.max().item())
-        if min_len != max_len:
-            print(
-                "[DSv4 diag] "
-                f"{label}: skipped nonuniform topk_lens min={min_len} max={max_len}",
-                flush=True,
-            )
-            return
-        needed = total * max_len
-        if max_len <= 0 or topk_flat.numel() < needed:
-            return
-        if topk_starts is None:
-            rows = topk_flat[:needed].reshape(total, max_len)
-            _v4_diag_check_equiv(label, rows, input_ids)
-            return
-        toks = _v4_diag_selected_tokens(seqlen)
-        flat_rows = torch.tensor(
-            [seq * seqlen + tok for seq in range(bs) for tok in toks],
-            dtype=torch.long,
-            device=topk_flat.device,
-        )
-        starts = topk_starts.index_select(0, flat_rows).long()
-        cols = torch.arange(max_len, dtype=torch.long, device=topk_flat.device)
-        rows = topk_flat[(starts.unsqueeze(1) + cols).reshape(-1)].reshape(
-            bs, len(toks), max_len
-        )
-        ref = rows[0:1].float()
-        diff = (rows.float() - ref).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int(
-            (diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item()
-        )
-        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
-            print(
-                "[DSv4 diag] "
-                f"{label}: bs={bs} seqlen={seqlen} toks={toks} "
-                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-                f"bad_rows={bad_rows}/{bs}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}: topk check failed: {exc!r}", flush=True)
-
-
-def _v4_diag_check_packed_kv(
-    label: str,
-    kv_flat: torch.Tensor,
-    kv_offsets: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-) -> None:
-    """Check equivalence of per-sequence packed KV slices.
-
-    `kv_flat` is sequence-concatenated, not token-major. For identical fresh
-    prefill probes, every sequence should have an equal-length packed slice.
-    """
-    batch = _v4_diag_get_equal_batch(input_ids)
-    if batch is None:
-        return
-    bs, seqlen, total = batch
-    if kv_offsets.size(0) < total:
-        return
-    try:
-        starts = []
-        for seq_idx in range(bs):
-            starts.append(int(kv_offsets[seq_idx * seqlen].item()))
-        lengths = [
-            (starts[i + 1] - starts[i]) if i + 1 < bs else (kv_flat.size(0) - starts[i])
-            for i in range(bs)
-        ]
-        if not lengths or min(lengths) <= 0 or len(set(lengths)) != 1:
-            print(
-                "[DSv4 diag] "
-                f"{label}: skipped nonuniform kv slice lengths={lengths[:8]}",
-                flush=True,
-            )
-            return
-        kv_len = lengths[0]
-        view = torch.stack(
-            [kv_flat[start : start + kv_len] for start in starts],
-            dim=0,
-        ).reshape(bs, kv_len, -1)
-        toks = _v4_diag_selected_tokens(kv_len)
-        selected = view.index_select(
-            1, torch.tensor(toks, dtype=torch.long, device=kv_flat.device)
-        )
-        ref = selected[0:1].float()
-        diff = (selected.float() - ref).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int((diff.reshape(bs, -1).amax(dim=1) > _V4_DIAG_TOL).sum().item())
-        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
-            print(
-                "[DSv4 diag] "
-                f"{label}: bs={bs} kv_len={kv_len} toks={toks} "
-                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-                f"bad_rows={bad_rows}/{bs}",
-                flush=True,
-            )
-        if _V4_DIAG_FULL_SEQ_LIMIT > 0 and kv_len <= _V4_DIAG_FULL_SEQ_LIMIT:
-            ref_full = view[0:1]
-            neq = view != ref_full
-            bad_tokens = neq.any(dim=2)
-            bad_rows_full = int(bad_tokens.any(dim=1).sum().item())
-            if bad_rows_full == 0:
-                if _V4_DIAG_VERBOSE:
-                    print(
-                        "[DSv4 diag] "
-                        f"{label}.full: bs={bs} kv_len={kv_len} max_abs=0 "
-                        f"mean_abs=0 bad_rows=0/{bs}",
-                        flush=True,
-                    )
-            else:
-                diff_full = (view.float() - ref_full.float()).abs()
-                bad_pos = bad_tokens.nonzero()
-                first_bad = (
-                    (int(bad_pos[0, 0].item()), int(bad_pos[0, 1].item()))
-                    if bad_pos.numel()
-                    else (-1, -1)
-                )
-                print(
-                    "[DSv4 diag] "
-                    f"{label}.full: bs={bs} kv_len={kv_len} "
-                    f"max_abs={float(diff_full.max().item()):.6g} "
-                    f"mean_abs={float(diff_full.mean().item()):.6g} "
-                    f"bad_rows={bad_rows_full}/{bs} first_bad_seq_pos={first_bad}",
-                    flush=True,
-                )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}: kv pack check failed: {exc!r}", flush=True)
-
-
-def _v4_diag_compare_ragged_attn_ref(
-    label: str,
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    attn_sink: torch.Tensor,
-    topk_flat: torch.Tensor,
-    topk_starts: torch.Tensor,
-    topk_lens: torch.Tensor,
-    kv_offsets: torch.Tensor,
-    max_topk: int,
-    softmax_scale: float,
-    out: torch.Tensor,
-    input_ids: Optional[torch.Tensor],
-) -> None:
-    """Compare Triton ragged attention output against the torch reference."""
-    if not _V4_DEEP_ATTN_REF_DIAG:
-        return
-    batch = _v4_diag_get_equal_batch(input_ids)
-    if batch is None:
-        return
-    bs, seqlen, total = batch
-    if q.size(0) < total or out.size(0) < total or topk_lens.size(0) < total:
-        return
-    try:
-        toks = _v4_diag_selected_tokens(seqlen)
-        flat_rows = torch.tensor(
-            [seq * seqlen + tok for seq in range(bs) for tok in toks],
-            dtype=torch.long,
-            device=q.device,
-        )
-        q_sel = q.index_select(0, flat_rows)
-        out_sel = out.index_select(0, flat_rows)
-        lens = topk_lens.index_select(0, flat_rows).to(torch.int64)
-        starts = topk_starts.index_select(0, flat_rows).to(torch.int64)
-        offsets = kv_offsets.index_select(0, flat_rows).to(torch.int32)
-        k_width = min(int(max_topk), int(lens.max().item()))
-        topk_idxs = torch.full(
-            (flat_rows.numel(), k_width), -1, dtype=torch.int32, device=q.device
-        )
-        for row in range(flat_rows.numel()):
-            length = min(int(lens[row].item()), k_width)
-            if length <= 0:
-                continue
-            local = topk_flat.narrow(0, int(starts[row].item()), length).to(
-                torch.int32
-            )
-            topk_idxs[row, :length] = torch.where(
-                local >= 0, local + offsets[row], local
-            )
-        ref = _sparse_attn_ragged_torch(
-            q_sel, kv, attn_sink, topk_idxs, float(softmax_scale)
-        )
-        diff = (out_sel.float() - ref.float()).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int(
-            (diff.reshape(flat_rows.numel(), -1).amax(dim=1) > _V4_DIAG_TOL)
-            .sum()
-            .item()
-        )
-        print(
-            "[DSv4 diag] "
-            f"{label}.torch_ref: rows={flat_rows.numel()} toks={toks} "
-            f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-            f"bad_rows={bad_rows}/{flat_rows.numel()}",
-            flush=True,
-        )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}.torch_ref: check failed: {exc!r}", flush=True)
-
-
-def _v4_diag_check_logits(label: str, logits: torch.Tensor) -> None:
-    if not _V4_DIAG_EQUIV or logits.dim() != 2 or logits.size(0) < 2:
-        return
-    try:
-        ref = logits[0:1].float()
-        diff = (logits.float() - ref).abs()
-        max_abs = float(diff.max().item())
-        mean_abs = float(diff.mean().item())
-        bad_rows = int((diff.amax(dim=1) > _V4_DIAG_TOL).sum().item())
-        argmax = logits.argmax(dim=-1).detach().cpu().tolist()
-        unique_argmax = len(set(int(x) for x in argmax))
-        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL or unique_argmax > 1:
-            print(
-                "[DSv4 diag] "
-                f"{label}: bs={logits.size(0)} max_abs={max_abs:.6g} "
-                f"mean_abs={mean_abs:.6g} bad_rows={bad_rows}/{logits.size(0)} "
-                f"unique_argmax={unique_argmax} argmax_head={argmax[:8]}",
-                flush=True,
-            )
-    except Exception as exc:
-        print(f"[DSv4 diag] {label}: logits check failed: {exc!r}", flush=True)
+    finally:
+        layer.reduce_results = reduce_results
+    if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
+        y = _v4_torch_tp_all_reduce(y)
+    return y
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -2095,7 +1577,7 @@ class DeepseekV4Attention(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]  flat ragged-batch hidden state
         positions: torch.Tensor,  # [num_tokens] int  absolute token positions
-        input_ids: Optional[torch.Tensor] = None,  # diagnostic equivalence only
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]  BF16 attention output
         """Compute attention for `x` at absolute token `positions`.
 
@@ -2112,16 +1594,6 @@ class DeepseekV4Attention(nn.Module):
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
-        deep_diag = _v4_diag_deep_attn_enabled(self.layer_id)
-        diag_prefix = f"L{self.layer_id}.attn"
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.input_normed", x, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.input_normed", x, input_ids
-            )
-            _v4_diag_check_equiv(
-                f"{diag_prefix}.positions", positions.unsqueeze(-1), input_ids
-            )
 
         # Idempotent one-time plumb of rotary_emb into compressor / indexer
         # (and the indexer's inner compressor). `rotary_emb` is set by the
@@ -2141,57 +1613,18 @@ class DeepseekV4Attention(nn.Module):
             act_quant_inplace(x, 128, "ue8m0")
         q_lora = self.wq_a(x)
         kv_pre = self.wkv(x)
-        if deep_diag:
-            _v4_diag_check_equiv(
-                f"{diag_prefix}.qkv_a_split",
-                torch.cat((q_lora, kv_pre), dim=-1),
-                input_ids,
-            )
-            _v4_diag_check_equiv(f"{diag_prefix}.q_lora", q_lora, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.q_lora", q_lora, input_ids
-            )
-            _v4_diag_check_equiv(f"{diag_prefix}.kv_pre", kv_pre, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.kv_pre", kv_pre, input_ids
-            )
         qr = self.q_norm(q_lora)  # [num_tokens, q_lora_rank]  shared with Indexer
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.qr_norm", qr, input_ids)
-            _v4_diag_check_equiv_full_short(f"{diag_prefix}.qr_norm", qr, input_ids)
         if _V4_FORCE_UE8M0_QUANT:
             qr = qr.clone()
             act_quant_inplace(qr, 128, "ue8m0")
         q = self.wq_b(qr).view(seqlen_total, self.n_local_heads, self.head_dim)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.q_proj", q, input_ids)
-            _v4_diag_check_equiv_full_short(f"{diag_prefix}.q_proj", q, input_ids)
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.q_head_norm", q, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.q_head_norm", q, input_ids
-            )
         # q [S, H, D] / kv [S, head_dim] — rotary_emb internally reshapes to
         # (1, num_tokens, -1, rotary_dim) so explicit batch dim is unnecessary.
         kv = self.kv_norm(kv_pre)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.kv_norm", kv, input_ids)
-            _v4_diag_check_equiv_full_short(f"{diag_prefix}.kv_norm", kv, input_ids)
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.q_post_rope", q, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.q_post_rope", q, input_ids
-            )
-            _v4_diag_check_equiv(f"{diag_prefix}.kv_post_rope", kv, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.kv_post_rope", kv, input_ids
-            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
-            if deep_diag:
-                _v4_diag_check_equiv(f"{diag_prefix}.kv_post_quant", kv, input_ids)
         # ===== Per-fwd metadata (built once in prepare_prefill/decode). =====
         # All per-fwd state read once. Production prepare_decode/prefill
         # always populates these; warmup goes through the same path
@@ -2247,10 +1680,6 @@ class DeepseekV4Attention(nn.Module):
                 qr_full=qr,
                 positions=positions,
             )
-            if deep_diag:
-                _v4_diag_check_equiv(
-                    f"{diag_prefix}.indexer_topk", indexer_topk_batched, input_ids
-                )
             # Phase C: build CSA paged-compress section in
             # `v4_kv_indices_csa` (window prefix already filled by Phase B).
             # Layer-local because indexer output differs per layer; consumed by
@@ -2286,17 +1715,6 @@ class DeepseekV4Attention(nn.Module):
         # CG-friendly. Otherwise fall back to ragged_varlen for prefill /
         # mixed batches.
         q_sa = q.contiguous()
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.q_sa", q_sa, input_ids)
-            _v4_diag_check_equiv_full_short(
-                f"{diag_prefix}.q_sa", q_sa, input_ids
-            )
-            if window_topk_batched is not None:
-                _v4_diag_check_equiv(
-                    f"{diag_prefix}.window_topk",
-                    window_topk_batched,
-                    input_ids,
-                )
         if attn_md.is_pure_decode:
             from atom.model_ops.v4_kernels import sparse_attn_v4_paged_decode
 
@@ -2317,8 +1735,6 @@ class DeepseekV4Attention(nn.Module):
                 self.attn_sink,
                 self.softmax_scale,
             )  # [S, H, head_dim]
-            if deep_diag:
-                _v4_diag_check_equiv(f"{diag_prefix}.paged_decode_raw", o, input_ids)
         else:
             # Pre-built `pack_meta` (built once in `_build_v4_pack_meta_for_ratio`)
             # carries every CPU/GPU index — the per-layer call is just GPU
@@ -2340,25 +1756,6 @@ class DeepseekV4Attention(nn.Module):
             topk_lens = layout["topk_lens"]
             kv_offsets = layout["kv_offsets"]
             max_topk = layout["max_topk"]
-            if deep_diag:
-                _v4_diag_check_equiv(
-                    f"{diag_prefix}.topk_lens",
-                    topk_lens.unsqueeze(-1),
-                    input_ids,
-                )
-                _v4_diag_check_flat_topk(
-                    f"{diag_prefix}.topk_flat",
-                    topk_flat,
-                    topk_lens,
-                    input_ids,
-                    topk_starts,
-                )
-                _v4_diag_check_packed_kv(
-                    f"{diag_prefix}.kv_sa",
-                    kv_sa,
-                    kv_offsets,
-                    input_ids,
-                )
             o = sparse_attn_ragged_varlen(
                 q_sa,
                 kv_sa,
@@ -2370,24 +1767,6 @@ class DeepseekV4Attention(nn.Module):
                 max_topk,
                 self.softmax_scale,
             )  # [S, H, head_dim]
-            if deep_diag:
-                _v4_diag_compare_ragged_attn_ref(
-                    f"{diag_prefix}.ragged_attn_raw",
-                    q_sa,
-                    kv_sa,
-                    self.attn_sink,
-                    topk_flat,
-                    topk_starts,
-                    topk_lens,
-                    kv_offsets,
-                    max_topk,
-                    self.softmax_scale,
-                    o,
-                    input_ids,
-                )
-                _v4_diag_check_equiv(
-                    f"{diag_prefix}.ragged_attn_raw", o, input_ids
-                )
 
         # Inverse RoPE on output's rope dims to remove absolute-position
         # contribution carried in by the value-side RoPE of the KV entries.
@@ -2398,28 +1777,11 @@ class DeepseekV4Attention(nn.Module):
         # over B and H. In-place writes hit the underlying storage.
         freqs_slice = self.rotary_emb.freqs_for_positions(positions)
         _apply_rotary_emb(o.unsqueeze(0)[..., -rd:], freqs_slice, inverse=True)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.inverse_rope", o, input_ids)
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
         o = o.view(seqlen_total, self.n_local_groups, -1)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.group_view", o, input_ids)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.wo_a", o, input_ids)
-        wo_b_in = o.flatten(1)
-        if deep_diag or _V4_TP_REDUCE_BACKEND == "torch":
-            x = _v4_diag_wo_b_staged(
-                self.wo_b,
-                wo_b_in,
-                input_ids,
-                diag_prefix,
-            )
-        else:
-            x = self.wo_b(wo_b_in)
-        if deep_diag:
-            _v4_diag_check_equiv(f"{diag_prefix}.wo_b", x, input_ids)
+        x = _v4_row_parallel_linear(self.wo_b, o.flatten(1))
         return x
 
     def _fill_csa_paged_compress(self, attn_md, total_tokens: int) -> None:
@@ -2940,10 +2302,6 @@ class Block(nn.Module):
             torch.Tensor
         ],  # [num_tokens] int  for hash-routed MoE layers
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  updated residual stream
-        diag = _v4_diag_layer_enabled(self.layer_id)
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.input_mhc", x, input_ids)
-
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = (
@@ -2951,34 +2309,18 @@ class Block(nn.Module):
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
         )
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_pre", x, input_ids)
-            if _v4_diag_deep_attn_enabled(self.layer_id):
-                _v4_diag_check_equiv_full_short(
-                    f"L{self.layer_id}.attn_hc_pre", x, input_ids
-                )
         x = self.attn_norm(x)  # [num_tokens, dim]
         x = self.attn(x, positions, input_ids=input_ids)  # [num_tokens, dim]
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.attn_out", x, input_ids)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.attn_hc_post", x, input_ids)
 
         # ----- FFN sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = self.hc_pre(
             x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_hc_pre", x, input_ids)
         x = self.ffn_norm(x)  # [num_tokens, dim]
         x = self.ffn(x, input_ids)  # [num_tokens, dim]
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_out", x, input_ids)
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
-        if diag:
-            _v4_diag_check_equiv(f"L{self.layer_id}.ffn_hc_post", x, input_ids)
         return x
 
 
@@ -3218,10 +2560,8 @@ class DeepseekV4Model(nn.Module):
         """
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
-        _v4_diag_check_equiv("model.embed", h, input_ids)
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        _v4_diag_check_equiv("model.embed_mhc", h, input_ids)
         if positions is None:
             positions = torch.arange(
                 input_ids.numel(), device=input_ids.device, dtype=torch.long
@@ -3235,9 +2575,7 @@ class DeepseekV4Model(nn.Module):
         x_hc = self.head.hc_head(  # [num_tokens, dim]
             h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
-        _v4_diag_check_equiv("model.hc_head", x_hc, input_ids)
         out = self.norm(x_hc)
-        _v4_diag_check_equiv("model.final_norm", out, input_ids)
         return out
 
 
@@ -3325,9 +2663,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         # Vocab projection is split off from `model.forward` so the latter
         # returns hidden_size-shaped tensors — required by ATOM's CUDAGraph
         # capture contract (outputs buffer is sized to hidden_size, not vocab).
-        logits = self.model.head.get_logits(hidden_states)
-        _v4_diag_check_logits("model.logits", logits)
-        return logits
+        return self.model.head.get_logits(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         """Return (param_name, weight_name, expert_id, shard_id) tuples for FusedMoE.
