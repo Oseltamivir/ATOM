@@ -164,7 +164,7 @@ _V4_PREFILL_DIAG_REF_LAYER_SPEC = os.environ.get(
 
 
 def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
-    y = x.clone()
+    y = _v4_prepare_tp_reduce_tensor(x)
     torch.distributed.all_reduce(y, group=get_tp_group().device_group)
     return y
 
@@ -194,6 +194,12 @@ def _v4_should_sync_prefill_tp_reduce() -> bool:
 def _v4_sync_prefill_tp_reduce() -> None:
     if _v4_should_sync_prefill_tp_reduce():
         torch.cuda.synchronize()
+
+
+def _v4_prepare_tp_reduce_tensor(x: torch.Tensor) -> torch.Tensor:
+    y = x.contiguous().clone()
+    _v4_sync_prefill_tp_reduce()
+    return y
 
 
 def _v4_prefill_diag_rank() -> int:
@@ -520,8 +526,6 @@ def _v4_row_parallel_linear(
             layer_id=layer_id,
         )
     if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
-        if sync_prefill_reduce:
-            torch.cuda.synchronize()
         if use_torch_reduce or diag_active:
             y_torch = _v4_torch_tp_all_reduce(y_local)
             if diag_active:
@@ -539,7 +543,10 @@ def _v4_row_parallel_linear(
             y_torch = None
         y_aiter = None
         if (not use_torch_reduce) or diag_active:
-            y_aiter = get_tp_group().all_reduce(y_local.clone(), ca_fp8_quant=False)
+            y_aiter = get_tp_group().all_reduce(
+                _v4_prepare_tp_reduce_tensor(y_local),
+                ca_fp8_quant=False,
+            )
             if diag_active:
                 _v4_prefill_diag_check(
                     f"{diag_label}.aiter_reduce", y_aiter, input_ids, layer_id
