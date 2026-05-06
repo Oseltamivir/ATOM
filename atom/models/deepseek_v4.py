@@ -117,6 +117,9 @@ _V4_TP_REDUCE_BACKEND = os.environ.get(
     "ATOM_DSV4_TP_REDUCE_BACKEND",
     os.environ.get("ATOM_DSV4_WO_B_REDUCE_BACKEND", "aiter"),
 ).lower()
+_V4_SYNC_PREFILL_TP_REDUCE = (
+    os.environ.get("ATOM_DSV4_SYNC_PREFILL_TP_REDUCE", "1") == "1"
+)
 _V4_PREFILL_DIAG = os.environ.get("ATOM_DSV4_PREFILL_DIAG", "0") == "1"
 _V4_PREFILL_DIAG_LAYER_SPEC = os.environ.get(
     "ATOM_DSV4_PREFILL_DIAG_LAYERS", "all"
@@ -176,6 +179,21 @@ def _v4_use_torch_tp_reduce() -> bool:
         return not bool(get_forward_context().context.is_dummy_run)
     except Exception:
         return True
+
+
+def _v4_should_sync_prefill_tp_reduce() -> bool:
+    if not _V4_SYNC_PREFILL_TP_REDUCE:
+        return False
+    try:
+        ctx = get_forward_context().context
+        return bool(ctx.is_prefill and not ctx.is_dummy_run)
+    except Exception:
+        return False
+
+
+def _v4_sync_prefill_tp_reduce() -> None:
+    if _v4_should_sync_prefill_tp_reduce():
+        torch.cuda.synchronize()
 
 
 def _v4_prefill_diag_rank() -> int:
@@ -444,7 +462,18 @@ def _v4_row_parallel_linear(
         input_ids, layer_id
     )
     use_torch_reduce = _v4_use_torch_tp_reduce()
-    if not diag_active and not use_torch_reduce:
+    sync_prefill_reduce = _v4_should_sync_prefill_tp_reduce()
+    manual_reduce = (
+        diag_active
+        or use_torch_reduce
+        or (
+            sync_prefill_reduce
+            and layer.tp_dim == 1
+            and layer.tp_size > 1
+            and layer.reduce_results
+        )
+    )
+    if not manual_reduce:
         return layer(x)
 
     reduce_results = layer.reduce_results
@@ -491,6 +520,8 @@ def _v4_row_parallel_linear(
             layer_id=layer_id,
         )
     if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
+        if sync_prefill_reduce:
+            torch.cuda.synchronize()
         if use_torch_reduce or diag_active:
             y_torch = _v4_torch_tp_all_reduce(y_local)
             if diag_active:
@@ -3031,6 +3062,7 @@ class MoE(nn.Module):
                     self.layer_id,
                 )
         if self.tp_size > 1:
+            _v4_sync_prefill_tp_reduce()
             if diag_enabled:
                 torch_reduced = _v4_torch_tp_all_reduce(routed)
                 aiter_reduced = tensor_model_parallel_all_reduce(routed.clone())
