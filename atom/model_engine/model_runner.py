@@ -1612,6 +1612,13 @@ class ModelRunner:
             with record_function(label):
                 hidden_states = self.model(input_ids, positions)
                 logits = self.model.compute_logits(hidden_states)
+                if self.use_v4:
+                    try:
+                        from atom.models.deepseek_v4 import _v4_prefill_diag_check
+
+                        _v4_prefill_diag_check("model.logits", logits, input_ids)
+                    except Exception as exc:
+                        logger.warning("DSv4 prefill diag logits failed: %r", exc)
         else:
             # decode[bs=128 tok=128 d=128]  or  decode[bs=128 tok=128 p=2 d=126 spec=3]
             label = f"decode[bs={bs}"
