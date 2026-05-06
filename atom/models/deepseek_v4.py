@@ -141,6 +141,23 @@ _V4_PREFILL_DIAG_SPARSE_HEAD = int(
 _V4_PREFILL_DIAG_SPARSE_ROWS = int(
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_SPARSE_ROWS", "8")
 )
+_V4_PREFILL_DIAG_LINEAR_COMPARE = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_LINEAR_COMPARE", "1") == "1"
+)
+_V4_PREFILL_DIAG_LINEAR_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_PREFILL_DIAG_LINEAR_LAYERS",
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_DEEP_LAYERS", "0"),
+)
+_V4_PREFILL_DIAG_REPLAY_ROWS = int(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_REPLAY_ROWS", "16")
+)
+_V4_PREFILL_DIAG_REF_COMPARE = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_REF_COMPARE", "1") == "1"
+)
+_V4_PREFILL_DIAG_REF_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_PREFILL_DIAG_REF_LAYERS",
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_DEEP_LAYERS", "0"),
+)
 
 
 def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -161,19 +178,13 @@ def _v4_use_torch_tp_reduce() -> bool:
         return True
 
 
-def _v4_row_parallel_linear(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
-    if not _v4_use_torch_tp_reduce():
-        return layer(x)
-
-    reduce_results = layer.reduce_results
-    layer.reduce_results = False
+def _v4_prefill_diag_rank() -> int:
     try:
-        y = layer(x)
-    finally:
-        layer.reduce_results = reduce_results
-    if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
-        y = _v4_torch_tp_all_reduce(y)
-    return y
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
 
 
 def _v4_prefill_diag_layer_in_spec(layer_id: int, spec_raw: str) -> bool:
@@ -198,6 +209,22 @@ def _v4_prefill_diag_deep_layer_enabled(layer_id: int) -> bool:
     if not _V4_PREFILL_DIAG:
         return False
     return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_DEEP_LAYER_SPEC)
+
+
+def _v4_prefill_diag_linear_enabled(layer_id: Optional[int]) -> bool:
+    if not _V4_PREFILL_DIAG or not _V4_PREFILL_DIAG_LINEAR_COMPARE:
+        return False
+    if layer_id is None:
+        return True
+    return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_LINEAR_LAYER_SPEC)
+
+
+def _v4_prefill_diag_ref_enabled(layer_id: Optional[int]) -> bool:
+    if not _V4_PREFILL_DIAG or not _V4_PREFILL_DIAG_REF_COMPARE:
+        return False
+    if layer_id is None:
+        return True
+    return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_REF_LAYER_SPEC)
 
 
 def _v4_prefill_diag_equal_batch(input_ids: Optional[torch.Tensor]):
@@ -238,6 +265,254 @@ def _v4_prefill_diag_equal_batch(input_ids: Optional[torch.Tensor]):
     except Exception as exc:
         print(f"[DSv4 prefill diag] setup failed: {exc!r}", flush=True)
         return None
+
+
+def _v4_prefill_diag_select_rows(
+    tensor: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> Optional[tuple[torch.Tensor, int, int]]:
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return None
+    bs, seqlen, total = batch
+    view = tensor.detach()
+    if view.size(0) == total:
+        return view.reshape(bs, seqlen, -1)[:, -1, :], bs, seqlen
+    if view.size(0) == bs:
+        return view.reshape(bs, -1), bs, seqlen
+    return None
+
+
+def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
+    rows_f = rows.detach().float()
+    ref = rows_f[0:1]
+    diff = (rows_f - ref).abs()
+    row_max = diff.reshape(rows_f.size(0), -1).amax(dim=1)
+    bad_rows = int((row_max > tol).sum().item())
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    bad = (row_max > tol).nonzero()
+    first_bad = int(bad[0].item()) if bad.numel() else -1
+    extra = ""
+    if rows_f.dim() >= 2 and rows_f.reshape(rows_f.size(0), -1).size(1) > 1:
+        flat = rows_f.reshape(rows_f.size(0), -1)
+        argmax = flat.argmax(dim=1).detach().cpu().tolist()
+        extra = (
+            f" unique_argmax={len(set(int(x) for x in argmax))}"
+            f" argmax_head={argmax[:_V4_PREFILL_DIAG_SPARSE_ROWS]}"
+        )
+    print(
+        "[DSv4 sparse diag] "
+        f"rank={_v4_prefill_diag_rank()} {label}: shape={tuple(rows.shape)} "
+        f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+        f"bad_rows={bad_rows}/{rows.size(0)} first_bad={first_bad}{extra}",
+        flush=True,
+    )
+
+
+def _v4_prefill_diag_pair_rows(
+    label: str, lhs_rows: torch.Tensor, rhs_rows: torch.Tensor, tol: float
+) -> None:
+    diff = (lhs_rows.detach().float() - rhs_rows.detach().float()).abs()
+    row_max = diff.reshape(diff.size(0), -1).amax(dim=1)
+    bad_rows = int((row_max > tol).sum().item())
+    bad = (row_max > tol).nonzero()
+    first_bad = int(bad[0].item()) if bad.numel() else -1
+    print(
+        "[DSv4 pair diag] "
+        f"rank={_v4_prefill_diag_rank()} {label}: shape={tuple(lhs_rows.shape)} "
+        f"max_abs={float(diff.max().item()):.6g} "
+        f"mean_abs={float(diff.mean().item()):.6g} "
+        f"bad_rows={bad_rows}/{lhs_rows.size(0)} first_bad={first_bad}",
+        flush=True,
+    )
+
+
+def _v4_prefill_diag_pair_check(
+    label: str,
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int] = None,
+) -> None:
+    if not _v4_prefill_diag_layer_enabled(layer_id):
+        return
+    lhs_info = _v4_prefill_diag_select_rows(lhs, input_ids)
+    rhs_info = _v4_prefill_diag_select_rows(rhs, input_ids)
+    if lhs_info is None or rhs_info is None:
+        return
+    lhs_rows, _, _ = lhs_info
+    rhs_rows, _, _ = rhs_info
+    if lhs_rows.shape != rhs_rows.shape:
+        return
+    _v4_prefill_diag_pair_rows(label, lhs_rows, rhs_rows, _V4_PREFILL_DIAG_TOL)
+
+
+def _v4_prefill_diag_tensor_meta(
+    label: str, tensor: Optional[torch.Tensor], layer_id: Optional[int] = None
+) -> None:
+    if tensor is None or not _V4_PREFILL_DIAG_VERBOSE:
+        return
+    if not _v4_prefill_diag_layer_enabled(layer_id):
+        return
+    try:
+        print(
+            "[DSv4 tensor diag] "
+            f"rank={_v4_prefill_diag_rank()} {label}: "
+            f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+            f"stride={tuple(tensor.stride())} contiguous={tensor.is_contiguous()} "
+            f"data_ptr={tensor.data_ptr()}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"[DSv4 tensor diag] {label}: meta failed: {exc!r}", flush=True)
+
+
+def _v4_prefill_diag_row_parallel_replay(
+    *,
+    layer: RowParallelLinear,
+    x: torch.Tensor,
+    y_local: torch.Tensor,
+    diag_label: str,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+) -> None:
+    x_info = _v4_prefill_diag_select_rows(x, input_ids)
+    y_info = _v4_prefill_diag_select_rows(y_local, input_ids)
+    if x_info is None or y_info is None:
+        return
+    x_rows, bs, _ = x_info
+    y_rows, _, _ = y_info
+    n = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+    x_sample = x_rows[:n].contiguous()
+    reduce_results = layer.reduce_results
+    layer.reduce_results = False
+    try:
+        replay = layer(x_sample)
+        _v4_prefill_diag_rows(
+            f"{diag_label}.replay_last_rows_local",
+            replay,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair_rows(
+            f"{diag_label}.actual_local_vs_replay",
+            y_rows[:n],
+            replay,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        replay_same = layer(x_rows[0:1].expand(n, -1).contiguous())
+        _v4_prefill_diag_rows(
+            f"{diag_label}.replay_row0_repeated_local",
+            replay_same,
+            _V4_PREFILL_DIAG_TOL,
+        )
+    except Exception as exc:
+        print(
+            "[DSv4 linear diag] "
+            f"rank={_v4_prefill_diag_rank()} {diag_label}.replay failed: {exc!r}",
+            flush=True,
+        )
+    finally:
+        layer.reduce_results = reduce_results
+
+
+def _v4_row_parallel_linear(
+    layer: RowParallelLinear,
+    x: torch.Tensor,
+    *,
+    diag_label: Optional[str] = None,
+    input_ids: Optional[torch.Tensor] = None,
+    layer_id: Optional[int] = None,
+) -> torch.Tensor:
+    diag_enabled = (
+        diag_label is not None
+        and input_ids is not None
+        and _v4_prefill_diag_linear_enabled(layer_id)
+    )
+    if not diag_enabled and not _v4_use_torch_tp_reduce():
+        return layer(x)
+
+    reduce_results = layer.reduce_results
+    layer.reduce_results = False
+    try:
+        if diag_enabled:
+            _v4_prefill_diag_check(f"{diag_label}.input", x, input_ids, layer_id)
+            _v4_prefill_diag_tensor_meta(
+                f"{diag_label}.input_meta", x, layer_id
+            )
+            _v4_prefill_diag_tensor_meta(
+                f"{diag_label}.weight", getattr(layer, "weight", None), layer_id
+            )
+            _v4_prefill_diag_tensor_meta(
+                f"{diag_label}.weight_scale",
+                getattr(layer, "weight_scale", None),
+                layer_id,
+            )
+            print(
+                "[DSv4 linear diag] "
+                f"rank={_v4_prefill_diag_rank()} {diag_label}: "
+                f"prefix={getattr(layer, 'prefix', '')} "
+                f"quant_type={getattr(layer, 'quant_type', None)} "
+                f"params_dtype={getattr(layer, 'params_dtype', None)} "
+                f"tp_size={getattr(layer, 'tp_size', None)} "
+                f"tp_dim={getattr(layer, 'tp_dim', None)} "
+                f"reduce_results={reduce_results} "
+                f"backend={_V4_TP_REDUCE_BACKEND}",
+                flush=True,
+            )
+        y_local = layer(x)
+    finally:
+        layer.reduce_results = reduce_results
+    if diag_enabled:
+        _v4_prefill_diag_check(
+            f"{diag_label}.local_no_reduce", y_local, input_ids, layer_id
+        )
+        _v4_prefill_diag_row_parallel_replay(
+            layer=layer,
+            x=x,
+            y_local=y_local,
+            diag_label=diag_label,
+            input_ids=input_ids,
+            layer_id=layer_id,
+        )
+    if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
+        if _v4_use_torch_tp_reduce() or diag_enabled:
+            y_torch = _v4_torch_tp_all_reduce(y_local)
+            if diag_enabled:
+                _v4_prefill_diag_check(
+                    f"{diag_label}.torch_reduce", y_torch, input_ids, layer_id
+                )
+                _v4_prefill_diag_pair_check(
+                    f"{diag_label}.torch_reduce_minus_local",
+                    y_torch,
+                    y_local,
+                    input_ids,
+                    layer_id,
+                )
+        else:
+            y_torch = None
+        y_aiter = None
+        if (not _v4_use_torch_tp_reduce()) or diag_enabled:
+            y_aiter = get_tp_group().all_reduce(y_local.clone(), ca_fp8_quant=False)
+            if diag_enabled:
+                _v4_prefill_diag_check(
+                    f"{diag_label}.aiter_reduce", y_aiter, input_ids, layer_id
+                )
+                if y_torch is not None:
+                    _v4_prefill_diag_pair_check(
+                        f"{diag_label}.aiter_minus_torch_reduce",
+                        y_aiter,
+                        y_torch,
+                        input_ids,
+                        layer_id,
+                    )
+        y = y_torch if _v4_use_torch_tp_reduce() else y_aiter
+        assert y is not None
+    else:
+        y = y_local
+    if diag_enabled:
+        _v4_prefill_diag_check(f"{diag_label}.result", y, input_ids, layer_id)
+    return y
 
 
 def _v4_prefill_diag_check(
@@ -286,46 +561,10 @@ def _v4_prefill_diag_check(
         print(f"[DSv4 prefill diag] {label}: check failed: {exc!r}", flush=True)
 
 
-def _v4_prefill_diag_rank() -> int:
-    try:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            return int(torch.distributed.get_rank())
-    except Exception:
-        pass
-    return -1
-
-
 def _v4_prefill_diag_sparse_enabled(layer_id: int) -> bool:
     if not _V4_PREFILL_DIAG or not _V4_PREFILL_DIAG_SPARSE_COMPARE:
         return False
     return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_SPARSE_LAYER_SPEC)
-
-
-def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
-    rows_f = rows.detach().float()
-    ref = rows_f[0:1]
-    diff = (rows_f - ref).abs()
-    row_max = diff.reshape(rows_f.size(0), -1).amax(dim=1)
-    bad_rows = int((row_max > tol).sum().item())
-    max_abs = float(diff.max().item()) if diff.numel() else 0.0
-    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
-    bad = (row_max > tol).nonzero()
-    first_bad = int(bad[0].item()) if bad.numel() else -1
-    extra = ""
-    if rows_f.dim() >= 2 and rows_f.reshape(rows_f.size(0), -1).size(1) > 1:
-        flat = rows_f.reshape(rows_f.size(0), -1)
-        argmax = flat.argmax(dim=1).detach().cpu().tolist()
-        extra = (
-            f" unique_argmax={len(set(int(x) for x in argmax))}"
-            f" argmax_head={argmax[:_V4_PREFILL_DIAG_SPARSE_ROWS]}"
-        )
-    print(
-        "[DSv4 sparse diag] "
-        f"rank={_v4_prefill_diag_rank()} {label}: shape={tuple(rows.shape)} "
-        f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
-        f"bad_rows={bad_rows}/{rows.size(0)} first_bad={first_bad}{extra}",
-        flush=True,
-    )
 
 
 def _v4_prefill_diag_pair(
@@ -2351,7 +2590,13 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
                 self.layer_id,
             )
-        x = _v4_row_parallel_linear(self.wo_b, o.flatten(1))
+        x = _v4_row_parallel_linear(
+            self.wo_b,
+            o.flatten(1),
+            diag_label=f"L{self.layer_id}.attn.wo_b",
+            input_ids=input_ids,
+            layer_id=self.layer_id,
+        )
         if deep_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.wo_b",
@@ -2476,19 +2721,43 @@ class Expert(nn.Module):
         self,
         x: torch.Tensor,  # [num_tokens, dim]
         weights: Optional[torch.Tensor] = None,  # [num_tokens, 1]  optional gate
+        *,
+        diag_label: Optional[str] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         dtype = x.dtype
         # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
         # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
         combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
+        if diag_label is not None and input_ids is not None:
+            _v4_prefill_diag_check(
+                f"{diag_label}.gate_up",
+                combined,
+                input_ids,
+                layer_id,
+            )
         gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
         x = F.silu(gate) * up  # [num_tokens, inter_dim_per_tp]
+        if diag_label is not None and input_ids is not None:
+            _v4_prefill_diag_check(
+                f"{diag_label}.act",
+                x,
+                input_ids,
+                layer_id,
+            )
         if weights is not None:
             x = weights * x
-        return self.w2(x.to(dtype))  # [num_tokens, dim]
+        return _v4_row_parallel_linear(
+            self.w2,
+            x.to(dtype),
+            diag_label=f"{diag_label}.w2" if diag_label is not None else None,
+            input_ids=input_ids,
+            layer_id=layer_id,
+        )  # [num_tokens, dim]
 
 
 class MoE(nn.Module):
@@ -2650,7 +2919,9 @@ class MoE(nn.Module):
         return topk_weights, topk_ids
 
     def routed_expert_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Gate + FusedMoE routed-expert pass.
 
@@ -2660,35 +2931,153 @@ class MoE(nn.Module):
         can read it.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        return self.experts(hidden_states=x, router_logits=router_logits)
+        diag_enabled = input_ids is not None and _v4_prefill_diag_ref_enabled(
+            self.layer_id
+        )
+        if diag_enabled:
+            _v4_prefill_diag_check(
+                f"L{self.layer_id}.ffn.router_logits",
+                router_logits,
+                input_ids,
+                self.layer_id,
+            )
+            try:
+                topk_weights, topk_ids = FusedMoE.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                    top_k=self.experts.top_k,
+                    renormalize=self.experts.renormalize,
+                    use_grouped_topk=self.experts.use_grouped_topk,
+                    topk_group=self.experts.topk_group,
+                    num_expert_group=self.experts.num_expert_group,
+                    custom_routing_function=self.experts.custom_routing_function,
+                    scoring_func=self.experts.scoring_func,
+                    e_score_correction_bias=self.experts.e_score_correction_bias,
+                    routed_scaling_factor=self.experts.routed_scaling_factor,
+                )
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.topk_weights",
+                    topk_weights,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.topk_ids",
+                    topk_ids.float(),
+                    input_ids,
+                    self.layer_id,
+                )
+            except Exception as exc:
+                print(
+                    "[DSv4 moe diag] "
+                    f"rank={_v4_prefill_diag_rank()} L{self.layer_id}.ffn.topk_ref failed: {exc!r}",
+                    flush=True,
+                )
+        routed = self.experts(hidden_states=x, router_logits=router_logits)
+        if diag_enabled:
+            _v4_prefill_diag_check(
+                f"L{self.layer_id}.ffn.routed_local",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
+        return routed
 
     def combine_outputs(
         self,
         routed: torch.Tensor,  # [num_tokens, dim]
         shared: Optional[torch.Tensor],  # [num_tokens, dim] or None
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Add shared-expert contribution (when not fused into routed) and
         all-reduce across TP ranks.
         """
+        diag_enabled = input_ids is not None and _v4_prefill_diag_ref_enabled(
+            self.layer_id
+        )
+        if diag_enabled:
+            _v4_prefill_diag_check(
+                f"L{self.layer_id}.ffn.routed_pre_combine",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
+            if shared is not None:
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.shared_local",
+                    shared,
+                    input_ids,
+                    self.layer_id,
+                )
         if shared is not None:
             routed = routed + shared
+            if diag_enabled:
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.routed_plus_shared",
+                    routed,
+                    input_ids,
+                    self.layer_id,
+                )
         if self.tp_size > 1:
-            if _v4_use_torch_tp_reduce():
+            if diag_enabled:
+                torch_reduced = _v4_torch_tp_all_reduce(routed)
+                aiter_reduced = tensor_model_parallel_all_reduce(routed.clone())
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.torch_reduce",
+                    torch_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check(
+                    f"L{self.layer_id}.ffn.aiter_reduce",
+                    aiter_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_pair_check(
+                    f"L{self.layer_id}.ffn.aiter_minus_torch_reduce",
+                    aiter_reduced,
+                    torch_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
+                routed = torch_reduced if _v4_use_torch_tp_reduce() else aiter_reduced
+            elif _v4_use_torch_tp_reduce():
                 routed = _v4_torch_tp_all_reduce(routed)
             else:
                 routed = tensor_model_parallel_all_reduce(routed)
+        if diag_enabled:
+            _v4_prefill_diag_check(
+                f"L{self.layer_id}.ffn.combined_result",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
         return routed
 
     def single_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Sequential: shared_experts → routed_experts → combine."""
-        shared = self.shared_experts(x) if self.shared_experts is not None else None
-        routed = self.routed_expert_forward(x)
-        return self.combine_outputs(routed, shared)
+        shared = (
+            self.shared_experts(
+                x,
+                diag_label=f"L{self.layer_id}.ffn.shared",
+                input_ids=input_ids,
+                layer_id=self.layer_id,
+            )
+            if self.shared_experts is not None
+            else None
+        )
+        routed = self.routed_expert_forward(x, input_ids)
+        return self.combine_outputs(routed, shared, input_ids)
 
     def dual_stream_moe_forward(
-        self, x: torch.Tensor  # [num_tokens, dim]
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Run shared_experts on `alt_stream` in parallel with routed_experts
         on the current stream. Mirrors V2's pattern. Both reads of `x` are
@@ -2698,10 +3087,15 @@ class MoE(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.alt_stream):
-            shared = self.shared_experts(x)
-        routed = self.routed_expert_forward(x)
+            shared = self.shared_experts(
+                x,
+                diag_label=f"L{self.layer_id}.ffn.shared",
+                input_ids=input_ids,
+                layer_id=self.layer_id,
+            )
+        routed = self.routed_expert_forward(x, input_ids)
         current_stream.wait_stream(self.alt_stream)
-        return self.combine_outputs(routed, shared)
+        return self.combine_outputs(routed, shared, input_ids)
 
     def forward(
         self,
@@ -2716,14 +3110,16 @@ class MoE(nn.Module):
         # a stale reference across forwards.
         if self.is_hash_layer:
             self._hash_input_ids = input_ids
-        if self._use_dual_stream:
+        if self._use_dual_stream and not _v4_prefill_diag_ref_enabled(self.layer_id):
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
             # dual vs single. Custom op = Dynamo barrier so stream context
             # inside `dual_stream_moe_forward` is opaque to torch.compile.
             y = torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
+        elif self._use_dual_stream:
+            y = self.dual_stream_moe_forward(x, input_ids)
         else:
-            y = self.single_stream_moe_forward(x)
+            y = self.single_stream_moe_forward(x, input_ids)
         if self.is_hash_layer:
             self._hash_input_ids = None
         return y
@@ -2787,12 +3183,37 @@ class Block(nn.Module):
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
 
+    def _hc_pre_torch_ref(
+        self,
+        residual: torch.Tensor,  # [num_tokens, hc, dim]  mHC-widened residual
+        hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
+        hc_scale: torch.Tensor,  # [3] fp32
+        hc_base: torch.Tensor,  # [mix_hc] fp32
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dtype = residual.dtype
+        x_flat = residual.flatten(-2)  # [num_tokens, hc*dim]
+        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
+        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, mix_hc]
+        pre, post, comb = hc_split_sinkhorn(
+            mixes,
+            hc_scale,
+            hc_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+        )
+        y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
+        return y.to(dtype), post, comb
+
     def hc_pre(
         self,
         residual: torch.Tensor,  # [num_tokens, hc, dim]  mHC-widened residual
         hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
         hc_scale: torch.Tensor,  # [3] fp32
         hc_base: torch.Tensor,  # [mix_hc] fp32
+        *,
+        diag_label: Optional[str] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reduce mHC residual `[num_tokens, hc, dim]` to sub-layer input `[num_tokens, dim]`.
 
@@ -2820,23 +3241,59 @@ class Block(nn.Module):
                 self.HC_POST_MULT,
                 int(self.hc_sinkhorn_iters),
             )
-            return y, post.squeeze(-1), comb
+            post = post.squeeze(-1)
+            if (
+                diag_label is not None
+                and input_ids is not None
+                and _v4_prefill_diag_ref_enabled(self.layer_id)
+            ):
+                try:
+                    y_ref, post_ref, comb_ref = self._hc_pre_torch_ref(
+                        residual, hc_fn, hc_scale, hc_base
+                    )
+                    _v4_prefill_diag_pair_check(
+                        f"{diag_label}.fused_minus_torch_y",
+                        y,
+                        y_ref,
+                        input_ids,
+                        self.layer_id,
+                    )
+                    _v4_prefill_diag_pair_check(
+                        f"{diag_label}.fused_minus_torch_post",
+                        post,
+                        post_ref,
+                        input_ids,
+                        self.layer_id,
+                    )
+                    _v4_prefill_diag_pair_check(
+                        f"{diag_label}.fused_minus_torch_comb",
+                        comb,
+                        comb_ref,
+                        input_ids,
+                        self.layer_id,
+                    )
+                except Exception as exc:
+                    print(
+                        "[DSv4 mhc diag] "
+                        f"rank={_v4_prefill_diag_rank()} {diag_label}.ref failed: {exc!r}",
+                        flush=True,
+                    )
+            return y, post, comb
 
         # Torch fallback (no-aiter): mirrors the reference math.
-        dtype = residual.dtype
-        x_flat = residual.flatten(-2)  # [num_tokens, hc*dim]
-        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
-        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, mix_hc]
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
+        return self._hc_pre_torch_ref(residual, hc_fn, hc_scale, hc_base)
+
+    def _hc_post_torch_ref(
+        self,
+        x: torch.Tensor,  # [num_tokens, dim]      sub-layer output
+        residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-layer residual
+        post: torch.Tensor,  # [num_tokens, hc]       from hc_pre
+        comb: torch.Tensor,  # [num_tokens, hc, hc]   from hc_pre
+    ) -> torch.Tensor:  # [num_tokens, hc, dim]  new residual
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
+            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
         )
-        y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
-        return y.to(dtype), post, comb
+        return y.type_as(x)
 
     def hc_post(
         self,
@@ -2844,6 +3301,9 @@ class Block(nn.Module):
         residual: torch.Tensor,  # [num_tokens, hc, dim]  pre-layer residual
         post: torch.Tensor,  # [num_tokens, hc]       from hc_pre
         comb: torch.Tensor,  # [num_tokens, hc, hc]   from hc_pre
+        *,
+        diag_label: Optional[str] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, hc, dim]  new residual
         """Expand sub-layer output `[num_tokens, dim]` back to mHC residual
         `[num_tokens, hc, dim]`.
@@ -2860,16 +3320,33 @@ class Block(nn.Module):
             # end-to-end in Block.forward), so no cast needed on the kernel path.
             out = torch.empty_like(residual)
             self._mhc_post(out, x, residual, post.unsqueeze(-1), comb)
+            if (
+                diag_label is not None
+                and input_ids is not None
+                and _v4_prefill_diag_ref_enabled(self.layer_id)
+            ):
+                try:
+                    ref = self._hc_post_torch_ref(x, residual, post, comb)
+                    _v4_prefill_diag_pair_check(
+                        f"{diag_label}.fused_minus_torch",
+                        out,
+                        ref,
+                        input_ids,
+                        self.layer_id,
+                    )
+                except Exception as exc:
+                    print(
+                        "[DSv4 mhc diag] "
+                        f"rank={_v4_prefill_diag_rank()} {diag_label}.ref failed: {exc!r}",
+                        flush=True,
+                    )
             return out
 
         # Torch fallback. fp32 (post, comb) × BF16 (x, residual) promotes to
         # fp32 by PyTorch promotion rules — cast back to x.dtype before return.
         # post.unsqueeze(-1) * x.unsqueeze(-2): [num_tokens, hc, dim] gating
         # comb.unsqueeze(-1) * residual.unsqueeze(-2): [num_tokens, hc, hc, dim]; sum over hc
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(
-            comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
-        )
-        return y.type_as(x)
+        return self._hc_post_torch_ref(x, residual, post, comb)
 
     def forward(
         self,
@@ -2891,7 +3368,12 @@ class Block(nn.Module):
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = (
             self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                diag_label=f"L{self.layer_id}.attn_hc_pre",
+                input_ids=input_ids,
             )
         )
         if layer_diag:
@@ -2917,7 +3399,14 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+        x = self.hc_post(
+            x,
+            residual,
+            post,
+            comb,
+            diag_label=f"L{self.layer_id}.attn_hc_post",
+            input_ids=input_ids,
+        )  # [num_tokens, hc, dim]
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_hc_post",
@@ -2929,7 +3418,12 @@ class Block(nn.Module):
         # ----- FFN sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            x,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            diag_label=f"L{self.layer_id}.ffn_hc_pre",
+            input_ids=input_ids,
         )
         if layer_diag:
             _v4_prefill_diag_check(
@@ -2954,7 +3448,14 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
-        x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
+        x = self.hc_post(
+            x,
+            residual,
+            post,
+            comb,
+            diag_label=f"L{self.layer_id}.ffn_hc_post",
+            input_ids=input_ids,
+        )  # [num_tokens, hc, dim]
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_hc_post",
