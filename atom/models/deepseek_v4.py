@@ -126,6 +126,13 @@ _V4_DEEP_ATTN_DIAG_LAYER_SPEC = os.environ.get(
     "ATOM_DSV4_DEEP_ATTN_DIAG_LAYERS", "0"
 )
 _V4_DEEP_ATTN_REF_DIAG = os.environ.get("ATOM_DSV4_DEEP_ATTN_REF_DIAG", "0") == "1"
+_V4_TP_REDUCE_BACKEND = os.environ.get(
+    "ATOM_DSV4_TP_REDUCE_BACKEND",
+    os.environ.get("ATOM_DSV4_WO_B_REDUCE_BACKEND", "aiter"),
+).lower()
+_V4_DIAG_COMPARE_WO_B_REDUCE = (
+    os.environ.get("ATOM_DSV4_DIAG_COMPARE_WO_B_REDUCE", "1") == "1"
+)
 
 
 def _v4_diag_layer_enabled(layer_id: int) -> bool:
@@ -274,6 +281,39 @@ def _v4_diag_check_equiv_full_short(
         print(f"[DSv4 diag] {label}.full: check failed: {exc!r}", flush=True)
 
 
+def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    y = x.clone()
+    torch.distributed.all_reduce(y, group=get_tp_group().device_group)
+    return y
+
+
+def _v4_diag_compare_reduce(
+    label: str,
+    actual: torch.Tensor,
+    ref: torch.Tensor,
+) -> None:
+    if not _V4_DIAG_EQUIV:
+        return
+    try:
+        diff = (actual.float() - ref.float()).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        bad_rows = int(
+            (diff.reshape(diff.size(0), -1).amax(dim=1) > _V4_DIAG_TOL)
+            .sum()
+            .item()
+        )
+        if _V4_DIAG_VERBOSE or max_abs > _V4_DIAG_TOL:
+            print(
+                "[DSv4 diag] "
+                f"{label}: max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{diff.size(0)}",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}: reduce compare failed: {exc!r}", flush=True)
+
+
 def _v4_diag_wo_b_staged(
     layer: RowParallelLinear,
     x: torch.Tensor,
@@ -335,7 +375,27 @@ def _v4_diag_wo_b_staged(
 
         if layer.tp_dim == 1 and layer.tp_size > 1 and layer.reduce_results:
             y_before_reduce = y_local.clone()
-            y_reduced = get_tp_group().all_reduce(y_local, ca_fp8_quant=False)
+            if _V4_TP_REDUCE_BACKEND == "torch":
+                y_reduced = _v4_torch_tp_all_reduce(y_before_reduce)
+                if _V4_DIAG_VERBOSE:
+                    print(
+                        "[DSv4 diag] "
+                        f"{label}.reduce_backend=torch",
+                        flush=True,
+                    )
+            else:
+                y_reduced = get_tp_group().all_reduce(y_local, ca_fp8_quant=False)
+                if _V4_DIAG_COMPARE_WO_B_REDUCE:
+                    y_torch = _v4_torch_tp_all_reduce(y_before_reduce)
+                    _v4_diag_compare_reduce(
+                        f"{label}.aiter_vs_torch_reduce", y_reduced, y_torch
+                    )
+                    _v4_diag_check_equiv(
+                        f"{label}.torch_reduce", y_torch, input_ids
+                    )
+                    _v4_diag_check_equiv_full_short(
+                        f"{label}.torch_reduce", y_torch, input_ids
+                    )
             _v4_diag_check_equiv(f"{label}.post_reduce", y_reduced, input_ids)
             _v4_diag_check_equiv_full_short(
                 f"{label}.post_reduce", y_reduced, input_ids
@@ -2349,7 +2409,7 @@ class DeepseekV4Attention(nn.Module):
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.wo_a", o, input_ids)
         wo_b_in = o.flatten(1)
-        if deep_diag:
+        if deep_diag or _V4_TP_REDUCE_BACKEND == "torch":
             x = _v4_diag_wo_b_staged(
                 self.wo_b,
                 wo_b_in,
@@ -2674,7 +2734,10 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            routed = tensor_model_parallel_all_reduce(routed)
+            if _V4_TP_REDUCE_BACKEND == "torch":
+                routed = _v4_torch_tp_all_reduce(routed)
+            else:
+                routed = tensor_model_parallel_all_reduce(routed)
         return routed
 
     def single_stream_moe_forward(
