@@ -68,6 +68,7 @@ from atom.model_ops.quant_v4 import (
     rotate_activation,
 )
 from atom.model_ops.sparse_attn_v4 import (
+    _sparse_attn_ragged_varlen_torch,
     hc_split_sinkhorn,
     sparse_attn_ragged_varlen,
 )
@@ -127,6 +128,19 @@ _V4_PREFILL_DIAG_VERBOSE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_VERBOSE", "0") == "1"
 )
 _V4_PREFILL_DIAG_TOL = float(os.environ.get("ATOM_DSV4_PREFILL_DIAG_TOL", "1e-3"))
+_V4_PREFILL_DIAG_SPARSE_COMPARE = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_SPARSE_COMPARE", "1") == "1"
+)
+_V4_PREFILL_DIAG_SPARSE_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_PREFILL_DIAG_SPARSE_LAYERS",
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_DEEP_LAYERS", "0"),
+)
+_V4_PREFILL_DIAG_SPARSE_HEAD = int(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_SPARSE_HEAD", "16")
+)
+_V4_PREFILL_DIAG_SPARSE_ROWS = int(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_SPARSE_ROWS", "8")
+)
 
 
 def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -270,6 +284,282 @@ def _v4_prefill_diag_check(
         )
     except Exception as exc:
         print(f"[DSv4 prefill diag] {label}: check failed: {exc!r}", flush=True)
+
+
+def _v4_prefill_diag_rank() -> int:
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return int(torch.distributed.get_rank())
+    except Exception:
+        pass
+    return -1
+
+
+def _v4_prefill_diag_sparse_enabled(layer_id: int) -> bool:
+    if not _V4_PREFILL_DIAG or not _V4_PREFILL_DIAG_SPARSE_COMPARE:
+        return False
+    return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_SPARSE_LAYER_SPEC)
+
+
+def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
+    rows_f = rows.detach().float()
+    ref = rows_f[0:1]
+    diff = (rows_f - ref).abs()
+    row_max = diff.reshape(rows_f.size(0), -1).amax(dim=1)
+    bad_rows = int((row_max > tol).sum().item())
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    bad = (row_max > tol).nonzero()
+    first_bad = int(bad[0].item()) if bad.numel() else -1
+    extra = ""
+    if rows_f.dim() >= 2 and rows_f.reshape(rows_f.size(0), -1).size(1) > 1:
+        flat = rows_f.reshape(rows_f.size(0), -1)
+        argmax = flat.argmax(dim=1).detach().cpu().tolist()
+        extra = (
+            f" unique_argmax={len(set(int(x) for x in argmax))}"
+            f" argmax_head={argmax[:_V4_PREFILL_DIAG_SPARSE_ROWS]}"
+        )
+    print(
+        "[DSv4 sparse diag] "
+        f"rank={_v4_prefill_diag_rank()} {label}: shape={tuple(rows.shape)} "
+        f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+        f"bad_rows={bad_rows}/{rows.size(0)} first_bad={first_bad}{extra}",
+        flush=True,
+    )
+
+
+def _v4_prefill_diag_pair(
+    label: str, lhs: torch.Tensor, rhs: torch.Tensor, tol: float
+) -> None:
+    diff = (lhs.detach().float() - rhs.detach().float()).abs()
+    row_max = diff.reshape(diff.size(0), -1).amax(dim=1)
+    bad_rows = int((row_max > tol).sum().item())
+    bad = (row_max > tol).nonzero()
+    first_bad = int(bad[0].item()) if bad.numel() else -1
+    print(
+        "[DSv4 sparse diag] "
+        f"rank={_v4_prefill_diag_rank()} {label}: shape={tuple(lhs.shape)} "
+        f"max_abs={float(diff.max().item()):.6g} "
+        f"mean_abs={float(diff.mean().item()):.6g} "
+        f"bad_rows={bad_rows}/{lhs.size(0)} first_bad={first_bad}",
+        flush=True,
+    )
+
+
+def _v4_prefill_diag_sparse_inputs(
+    *,
+    layer_id: int,
+    ratio: int,
+    q_sa: torch.Tensor,
+    kv_sa: torch.Tensor,
+    topk_flat: torch.Tensor,
+    topk_starts: torch.Tensor,
+    topk_lens: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    max_topk: int,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    """Dump enough sparse-attn pack state to split packer vs kernel bugs."""
+    if not _v4_prefill_diag_sparse_enabled(layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    try:
+        device = q_sa.device
+        last_rows = torch.arange(bs, device=device, dtype=torch.long) * seqlen
+        last_rows = last_rows + (seqlen - 1)
+        q_last = q_sa.index_select(0, last_rows)
+        starts_last = topk_starts.index_select(0, last_rows).long()
+        lens_last = topk_lens.index_select(0, last_rows).long()
+        offsets_last = kv_offsets.index_select(0, last_rows).long()
+        k_width = int(lens_last.max().item()) if lens_last.numel() else 0
+        k_width = max(k_width, 1)
+        k_arange = torch.arange(k_width, device=device, dtype=torch.long)
+        local = torch.full((bs, k_width), -1, device=device, dtype=torch.long)
+        flat_pos = starts_last.view(-1, 1) + k_arange.view(1, -1)
+        valid_width = k_arange.view(1, -1) < lens_last.view(-1, 1)
+        valid_flat = valid_width & (flat_pos >= 0) & (flat_pos < topk_flat.numel())
+        safe_pos = torch.where(valid_flat, flat_pos, torch.zeros_like(flat_pos))
+        gathered = topk_flat.index_select(0, safe_pos.reshape(-1)).reshape(
+            bs, k_width
+        )
+        local = torch.where(valid_flat, gathered.long(), local)
+        global_idx = torch.where(local >= 0, local + offsets_last.view(-1, 1), local)
+        valid_global = (global_idx >= 0) & (global_idx < kv_sa.size(0))
+        bad_global = int(((global_idx >= kv_sa.size(0)) & (local >= 0)).sum().item())
+        invalid_count = int((local < 0).sum().item())
+        valid_count = int(valid_global.sum().item())
+
+        head = max(1, _V4_PREFILL_DIAG_SPARSE_HEAD)
+        rows = max(1, _V4_PREFILL_DIAG_SPARSE_ROWS)
+        starts_cpu = starts_last[:rows].detach().cpu().tolist()
+        lens_cpu = lens_last[:rows].detach().cpu().tolist()
+        offsets_cpu = offsets_last[:rows].detach().cpu().tolist()
+        local_cpu = local[:rows, :head].detach().cpu().tolist()
+        global_cpu = global_idx[:rows, :head].detach().cpu().tolist()
+        print(
+            "[DSv4 sparse diag] "
+            f"rank={_v4_prefill_diag_rank()} L{layer_id} ratio={ratio} "
+            f"bs={bs} seqlen={seqlen} total={total} max_topk={max_topk} "
+            f"q={tuple(q_sa.shape)} kv_sa={tuple(kv_sa.shape)} "
+            f"topk_flat={tuple(topk_flat.shape)} k_width={k_width} "
+            f"valid_global={valid_count} invalid={invalid_count} "
+            f"bad_global={bad_global}",
+            flush=True,
+        )
+        print(
+            "[DSv4 sparse diag] "
+            f"rank={_v4_prefill_diag_rank()} L{layer_id} starts_head={starts_cpu} "
+            f"lens_head={lens_cpu} offsets_head={offsets_cpu} "
+            f"local_head={local_cpu} global_head={global_cpu}",
+            flush=True,
+        )
+
+        _v4_prefill_diag_rows(f"L{layer_id}.sparse.q_last", q_last, _V4_PREFILL_DIAG_TOL)
+        _v4_prefill_diag_rows(
+            f"L{layer_id}.sparse.local_topk_last",
+            local,
+            0.0,
+        )
+        _v4_prefill_diag_rows(
+            f"L{layer_id}.sparse.lens_last",
+            lens_last.view(-1, 1),
+            0.0,
+        )
+
+        safe_global = torch.where(valid_global, global_idx, torch.zeros_like(global_idx))
+        kv_gather = kv_sa.index_select(0, safe_global.reshape(-1)).reshape(
+            bs, k_width, kv_sa.size(-1)
+        )
+        common_valid = valid_global & valid_global[0:1]
+        kv_diff = (kv_gather.float() - kv_gather[0:1].float()).abs()
+        kv_diff = torch.where(
+            common_valid[:, :, None], kv_diff, torch.zeros_like(kv_diff)
+        )
+        kv_row_max = kv_diff.reshape(bs, -1).amax(dim=1)
+        kv_bad_rows = int((kv_row_max > _V4_PREFILL_DIAG_TOL).sum().item())
+        print(
+            "[DSv4 sparse diag] "
+            f"rank={_v4_prefill_diag_rank()} L{layer_id}.sparse.kv_gather_last: "
+            f"shape={tuple(kv_gather.shape)} max_abs={float(kv_diff.max().item()):.6g} "
+            f"mean_abs={float(kv_diff.mean().item()):.6g} "
+            f"bad_rows={kv_bad_rows}/{bs} common_valid={int(common_valid.sum().item())}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(
+            f"[DSv4 sparse diag] rank={_v4_prefill_diag_rank()} "
+            f"L{layer_id}.inputs failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _v4_prefill_diag_sparse_compare(
+    *,
+    layer_id: int,
+    ratio: int,
+    q_sa: torch.Tensor,
+    kv_sa: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_flat: torch.Tensor,
+    topk_starts: torch.Tensor,
+    topk_lens: torch.Tensor,
+    kv_offsets: torch.Tensor,
+    max_topk: int,
+    softmax_scale: float,
+    triton_out: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+) -> None:
+    if not _v4_prefill_diag_sparse_enabled(layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, _ = batch
+    try:
+        device = q_sa.device
+        last_rows = torch.arange(bs, device=device, dtype=torch.long) * seqlen
+        last_rows = last_rows + (seqlen - 1)
+        q_last = q_sa.index_select(0, last_rows)
+        triton_last = triton_out.index_select(0, last_rows)
+        starts_last = topk_starts.index_select(0, last_rows).long()
+        lens_last = topk_lens.index_select(0, last_rows).long()
+        offsets_last = kv_offsets.index_select(0, last_rows).long()
+        torch_last = _sparse_attn_ragged_varlen_torch(
+            q_last,
+            kv_sa,
+            attn_sink,
+            topk_flat,
+            starts_last,
+            lens_last,
+            offsets_last,
+            max_topk,
+            softmax_scale,
+        )
+        _v4_prefill_diag_rows(
+            f"L{layer_id}.sparse.triton_last",
+            triton_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"L{layer_id}.sparse.torch_last",
+            torch_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair(
+            f"L{layer_id}.sparse.triton_minus_torch",
+            triton_last,
+            torch_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+
+        k_width = int(lens_last.max().item()) if lens_last.numel() else 0
+        k_width = max(k_width, 1)
+        k_arange = torch.arange(k_width, device=device, dtype=torch.long)
+        valid_width = k_arange.view(1, -1) < lens_last.view(-1, 1)
+        flat_pos = starts_last.view(-1, 1) + k_arange.view(1, -1)
+        valid_flat = valid_width & (flat_pos >= 0) & (flat_pos < topk_flat.numel())
+        safe_pos = torch.where(valid_flat, flat_pos, torch.zeros_like(flat_pos))
+        local = topk_flat.index_select(0, safe_pos.reshape(-1)).reshape(bs, k_width)
+        local = torch.where(valid_flat, local.long(), torch.full_like(local, -1))
+        global_idx = torch.where(local >= 0, local + offsets_last.view(-1, 1), local)
+        valid = (global_idx >= 0) & (global_idx < kv_sa.size(0))
+        safe_global = torch.where(valid, global_idx, torch.zeros_like(global_idx))
+        kv_gather = kv_sa.index_select(0, safe_global.reshape(-1)).reshape(
+            bs, k_width, kv_sa.size(-1)
+        )
+        scores = torch.einsum("bhd,bkd->bhk", q_last.float(), kv_gather.float())
+        scores = scores * float(softmax_scale)
+        scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+        sink = attn_sink.float().view(1, -1, 1).expand(bs, -1, -1)
+        probs = torch.softmax(torch.cat((sink, scores), dim=-1), dim=-1)[..., 1:]
+        dense_last = torch.einsum("bhk,bkd->bhd", probs, kv_gather.float())
+        dense_last = dense_last.to(dtype=triton_last.dtype)
+        _v4_prefill_diag_rows(
+            f"L{layer_id}.sparse.dense_last",
+            dense_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair(
+            f"L{layer_id}.sparse.triton_minus_dense",
+            triton_last,
+            dense_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair(
+            f"L{layer_id}.sparse.torch_minus_dense",
+            torch_last,
+            dense_last,
+            _V4_PREFILL_DIAG_TOL,
+        )
+    except Exception as exc:
+        print(
+            f"[DSv4 sparse diag] rank={_v4_prefill_diag_rank()} "
+            f"L{layer_id}.compare failed: {exc!r}",
+            flush=True,
+        )
 
 
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
@@ -1986,6 +2276,19 @@ class DeepseekV4Attention(nn.Module):
             topk_lens = layout["topk_lens"]
             kv_offsets = layout["kv_offsets"]
             max_topk = layout["max_topk"]
+            if deep_diag:
+                _v4_prefill_diag_sparse_inputs(
+                    layer_id=self.layer_id,
+                    ratio=ratio,
+                    q_sa=q_sa,
+                    kv_sa=kv_sa,
+                    topk_flat=topk_flat,
+                    topk_starts=topk_starts,
+                    topk_lens=topk_lens,
+                    kv_offsets=kv_offsets,
+                    max_topk=max_topk,
+                    input_ids=input_ids,
+                )
             o = sparse_attn_ragged_varlen(
                 q_sa,
                 kv_sa,
@@ -1997,6 +2300,22 @@ class DeepseekV4Attention(nn.Module):
                 max_topk,
                 self.softmax_scale,
             )  # [S, H, head_dim]
+            if deep_diag:
+                _v4_prefill_diag_sparse_compare(
+                    layer_id=self.layer_id,
+                    ratio=ratio,
+                    q_sa=q_sa,
+                    kv_sa=kv_sa,
+                    attn_sink=self.attn_sink,
+                    topk_flat=topk_flat,
+                    topk_starts=topk_starts,
+                    topk_lens=topk_lens,
+                    kv_offsets=kv_offsets,
+                    max_topk=max_topk,
+                    softmax_scale=self.softmax_scale,
+                    triton_out=o,
+                    input_ids=input_ids,
+                )
         if deep_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.sparse_attn_raw",
