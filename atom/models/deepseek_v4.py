@@ -36,7 +36,10 @@ from aiter import (
     indexer_k_quant_and_cache,
 )
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
-from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
+from aiter.dist.parallel_state import (
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
@@ -53,6 +56,7 @@ from atom.model_ops.layernorm import RMSNorm, rmsnorm2d_fwd_
 from atom.model_ops.triton_rmsnorm_nw import rmsnorm_nw
 from atom.model_ops.linear import (
     ColumnParallelLinear,
+    gemm_a8w8_blockscale_preshuffle_impl,
     MergedColumnParallelLinear,
     MergedReplicatedLinear,
     ReplicatedLinear,
@@ -268,6 +272,86 @@ def _v4_diag_check_equiv_full_short(
         )
     except Exception as exc:
         print(f"[DSv4 diag] {label}.full: check failed: {exc!r}", flush=True)
+
+
+def _v4_diag_wo_b_staged(
+    layer: RowParallelLinear,
+    x: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    diag_prefix: str,
+) -> torch.Tensor:
+    """Run attention wo_b with diagnostics around quant, GEMM, and TP reduce."""
+    label = f"{diag_prefix}.wo_b"
+    _v4_diag_check_equiv(f"{label}.input", x, input_ids)
+    _v4_diag_check_equiv_full_short(f"{label}.input", x, input_ids)
+    try:
+        if layer.quant_type.value != aiter.QuantType.per_1x128.value:
+            print(
+                "[DSv4 diag] "
+                f"{label}: staged path skipped for quant_type={layer.quant_type}",
+                flush=True,
+            )
+            y = layer(x)
+            _v4_diag_check_equiv(f"{label}.post_reduce", y, input_ids)
+            return y
+
+        qx, x_scale = layer.quant_func(
+            x,
+            quant_dtype=layer.params_dtype,
+            scale=getattr(layer, "input_scale", None),
+            transpose_scale=True,
+        )
+        if _V4_DIAG_VERBOSE:
+            print(
+                "[DSv4 diag] "
+                f"{label}.meta: "
+                f"x={tuple(x.shape)} {x.dtype} "
+                f"qx={tuple(qx.shape)} {qx.dtype} "
+                f"x_scale={tuple(x_scale.shape)} {x_scale.dtype} "
+                f"w={tuple(layer.weight.shape)} {layer.weight.dtype} "
+                f"w_scale={tuple(layer.weight_scale.shape)} "
+                f"{layer.weight_scale.dtype} "
+                f"tp_dim={layer.tp_dim} tp_size={layer.tp_size} "
+                f"reduce={layer.reduce_results}",
+                flush=True,
+            )
+        _v4_diag_check_equiv(f"{label}.qx", qx, input_ids)
+        _v4_diag_check_equiv_full_short(f"{label}.qx", qx, input_ids)
+        _v4_diag_check_equiv(f"{label}.x_scale", x_scale, input_ids)
+        _v4_diag_check_equiv_full_short(f"{label}.x_scale", x_scale, input_ids)
+
+        y_local = gemm_a8w8_blockscale_preshuffle_impl(
+            qx,
+            layer.weight,
+            x_scale,
+            layer.weight_scale,
+            dtype=dtypes.bf16,
+            prefix=layer.prefix,
+        )
+        if layer.bias is not None:
+            y_local += layer.bias
+        _v4_diag_check_equiv(f"{label}.local_gemm", y_local, input_ids)
+        _v4_diag_check_equiv_full_short(f"{label}.local_gemm", y_local, input_ids)
+
+        if layer.tp_dim == 1 and layer.tp_size > 1 and layer.reduce_results:
+            y_before_reduce = y_local.clone()
+            y_reduced = get_tp_group().all_reduce(y_local, ca_fp8_quant=False)
+            _v4_diag_check_equiv(f"{label}.post_reduce", y_reduced, input_ids)
+            _v4_diag_check_equiv_full_short(
+                f"{label}.post_reduce", y_reduced, input_ids
+            )
+            _v4_diag_check_equiv(
+                f"{label}.reduce_delta", y_reduced - y_before_reduce, input_ids
+            )
+            return y_reduced
+
+        _v4_diag_check_equiv(f"{label}.post_reduce", y_local, input_ids)
+        return y_local
+    except Exception as exc:
+        print(f"[DSv4 diag] {label}.staged: failed: {exc!r}", flush=True)
+        y = layer(x)
+        _v4_diag_check_equiv(f"{label}.fallback", y, input_ids)
+        return y
 
 
 def _v4_diag_check_flat_topk(
@@ -2264,7 +2348,16 @@ class DeepseekV4Attention(nn.Module):
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.wo_a", o, input_ids)
-        x = self.wo_b(o.flatten(1))
+        wo_b_in = o.flatten(1)
+        if deep_diag:
+            x = _v4_diag_wo_b_staged(
+                self.wo_b,
+                wo_b_in,
+                input_ids,
+                diag_prefix,
+            )
+        else:
+            x = self.wo_b(wo_b_in)
         if deep_diag:
             _v4_diag_check_equiv(f"{diag_prefix}.wo_b", x, input_ids)
         return x
