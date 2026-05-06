@@ -35,7 +35,6 @@ from aiter import (
     get_hip_quant,
     indexer_k_quant_and_cache,
 )
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -165,7 +164,27 @@ _V4_PREFILL_DIAG_REF_LAYER_SPEC = os.environ.get(
 
 def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     y = _v4_prepare_tp_reduce_tensor(x)
-    torch.distributed.all_reduce(y, group=get_tp_group().device_group)
+    # The default blocking API can still expose CUDA stream timing here: the
+    # next ATOM kernels may consume partially reduced rows under high prefill
+    # concurrency. Waiting on the Work object makes the completion boundary
+    # explicit before returning the tensor to the model.
+    work = torch.distributed.all_reduce(
+        y,
+        group=get_tp_group().device_group,
+        async_op=True,
+    )
+    work.wait()
+    return y
+
+
+def _v4_aiter_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    y = get_tp_group().all_reduce(
+        _v4_prepare_tp_reduce_tensor(x)
+        if _v4_should_sync_prefill_tp_reduce()
+        else x,
+        ca_fp8_quant=False,
+    )
+    _v4_sync_prefill_tp_reduce()
     return y
 
 
@@ -543,10 +562,7 @@ def _v4_row_parallel_linear(
             y_torch = None
         y_aiter = None
         if (not use_torch_reduce) or diag_active:
-            y_aiter = get_tp_group().all_reduce(
-                _v4_prepare_tp_reduce_tensor(y_local),
-                ca_fp8_quant=False,
-            )
+            y_aiter = _v4_aiter_tp_all_reduce(y_local)
             if diag_active:
                 _v4_prefill_diag_check(
                     f"{diag_label}.aiter_reduce", y_aiter, input_ids, layer_id
@@ -3072,7 +3088,7 @@ class MoE(nn.Module):
             _v4_sync_prefill_tp_reduce()
             if diag_enabled:
                 torch_reduced = _v4_torch_tp_all_reduce(routed)
-                aiter_reduced = tensor_model_parallel_all_reduce(routed.clone())
+                aiter_reduced = _v4_aiter_tp_all_reduce(routed)
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.torch_reduce",
                     torch_reduced,
@@ -3096,7 +3112,7 @@ class MoE(nn.Module):
             elif _v4_use_torch_tp_reduce():
                 routed = _v4_torch_tp_all_reduce(routed)
             else:
-                routed = tensor_model_parallel_all_reduce(routed)
+                routed = _v4_aiter_tp_all_reduce(routed)
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.combined_result",
