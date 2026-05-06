@@ -227,6 +227,22 @@ def _v4_prefill_diag_ref_enabled(layer_id: Optional[int]) -> bool:
     return _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_REF_LAYER_SPEC)
 
 
+def _v4_prefill_diag_linear_active(
+    input_ids: Optional[torch.Tensor], layer_id: Optional[int]
+) -> bool:
+    if not _v4_prefill_diag_linear_enabled(layer_id):
+        return False
+    return _v4_prefill_diag_equal_batch(input_ids) is not None
+
+
+def _v4_prefill_diag_ref_active(
+    input_ids: Optional[torch.Tensor], layer_id: Optional[int]
+) -> bool:
+    if not _v4_prefill_diag_ref_enabled(layer_id):
+        return False
+    return _v4_prefill_diag_equal_batch(input_ids) is not None
+
+
 def _v4_prefill_diag_equal_batch(input_ids: Optional[torch.Tensor]):
     if not _V4_PREFILL_DIAG or input_ids is None:
         return None
@@ -424,18 +440,17 @@ def _v4_row_parallel_linear(
     input_ids: Optional[torch.Tensor] = None,
     layer_id: Optional[int] = None,
 ) -> torch.Tensor:
-    diag_enabled = (
-        diag_label is not None
-        and input_ids is not None
-        and _v4_prefill_diag_linear_enabled(layer_id)
+    diag_active = diag_label is not None and _v4_prefill_diag_linear_active(
+        input_ids, layer_id
     )
-    if not diag_enabled and not _v4_use_torch_tp_reduce():
+    use_torch_reduce = _v4_use_torch_tp_reduce()
+    if not diag_active and not use_torch_reduce:
         return layer(x)
 
     reduce_results = layer.reduce_results
     layer.reduce_results = False
     try:
-        if diag_enabled:
+        if diag_active:
             _v4_prefill_diag_check(f"{diag_label}.input", x, input_ids, layer_id)
             _v4_prefill_diag_tensor_meta(
                 f"{diag_label}.input_meta", x, layer_id
@@ -463,7 +478,7 @@ def _v4_row_parallel_linear(
         y_local = layer(x)
     finally:
         layer.reduce_results = reduce_results
-    if diag_enabled:
+    if diag_active:
         _v4_prefill_diag_check(
             f"{diag_label}.local_no_reduce", y_local, input_ids, layer_id
         )
@@ -476,9 +491,9 @@ def _v4_row_parallel_linear(
             layer_id=layer_id,
         )
     if layer.tp_dim == 1 and layer.tp_size > 1 and reduce_results:
-        if _v4_use_torch_tp_reduce() or diag_enabled:
+        if use_torch_reduce or diag_active:
             y_torch = _v4_torch_tp_all_reduce(y_local)
-            if diag_enabled:
+            if diag_active:
                 _v4_prefill_diag_check(
                     f"{diag_label}.torch_reduce", y_torch, input_ids, layer_id
                 )
@@ -492,9 +507,9 @@ def _v4_row_parallel_linear(
         else:
             y_torch = None
         y_aiter = None
-        if (not _v4_use_torch_tp_reduce()) or diag_enabled:
+        if (not use_torch_reduce) or diag_active:
             y_aiter = get_tp_group().all_reduce(y_local.clone(), ca_fp8_quant=False)
-            if diag_enabled:
+            if diag_active:
                 _v4_prefill_diag_check(
                     f"{diag_label}.aiter_reduce", y_aiter, input_ids, layer_id
                 )
@@ -506,11 +521,11 @@ def _v4_row_parallel_linear(
                         input_ids,
                         layer_id,
                     )
-        y = y_torch if _v4_use_torch_tp_reduce() else y_aiter
+        y = y_torch if use_torch_reduce else y_aiter
         assert y is not None
     else:
         y = y_local
-    if diag_enabled:
+    if diag_active:
         _v4_prefill_diag_check(f"{diag_label}.result", y, input_ids, layer_id)
     return y
 
@@ -552,7 +567,8 @@ def _v4_prefill_diag_check(
             extra = f" unique_argmax={unique_argmax} argmax_head={argmax[:8]}"
         print(
             "[DSv4 prefill diag] "
-            f"{label}: bs={bs} seqlen={seqlen} shape={tuple(tensor.shape)} "
+            f"rank={_v4_prefill_diag_rank()} {label}: "
+            f"bs={bs} seqlen={seqlen} shape={tuple(tensor.shape)} "
             f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
             f"bad_rows={bad_rows}/{bs} first_bad={first_bad}{extra}",
             flush=True,
@@ -2931,9 +2947,7 @@ class MoE(nn.Module):
         can read it.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
-        diag_enabled = input_ids is not None and _v4_prefill_diag_ref_enabled(
-            self.layer_id
-        )
+        diag_enabled = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.router_logits",
@@ -2992,9 +3006,7 @@ class MoE(nn.Module):
         """Add shared-expert contribution (when not fused into routed) and
         all-reduce across TP ranks.
         """
-        diag_enabled = input_ids is not None and _v4_prefill_diag_ref_enabled(
-            self.layer_id
-        )
+        diag_enabled = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.routed_pre_combine",
@@ -3110,7 +3122,9 @@ class MoE(nn.Module):
         # a stale reference across forwards.
         if self.is_hash_layer:
             self._hash_input_ids = input_ids
-        if self._use_dual_stream and not _v4_prefill_diag_ref_enabled(self.layer_id):
+        if self._use_dual_stream and not _v4_prefill_diag_ref_active(
+            input_ids, self.layer_id
+        ):
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
             # dual vs single. Custom op = Dynamo barrier so stream context
@@ -3244,8 +3258,7 @@ class Block(nn.Module):
             post = post.squeeze(-1)
             if (
                 diag_label is not None
-                and input_ids is not None
-                and _v4_prefill_diag_ref_enabled(self.layer_id)
+                and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
             ):
                 try:
                     y_ref, post_ref, comb_ref = self._hc_pre_torch_ref(
@@ -3322,8 +3335,7 @@ class Block(nn.Module):
             self._mhc_post(out, x, residual, post.unsqueeze(-1), comb)
             if (
                 diag_label is not None
-                and input_ids is not None
-                and _v4_prefill_diag_ref_enabled(self.layer_id)
+                and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
             ):
                 try:
                     ref = self._hc_post_torch_ref(x, residual, post, comb)
