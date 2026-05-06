@@ -124,8 +124,20 @@ def _v4_torch_tp_all_reduce(x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _v4_row_parallel_linear(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+def _v4_use_torch_tp_reduce() -> bool:
     if _V4_TP_REDUCE_BACKEND != "torch":
+        return False
+    # Warmup dummy outputs are discarded. Avoid cold-starting a second torch
+    # NCCL communicator there because checkpoint loading can skew rank arrival
+    # by several minutes, causing a process-group timeout before serving starts.
+    try:
+        return not bool(get_forward_context().context.is_dummy_run)
+    except Exception:
+        return True
+
+
+def _v4_row_parallel_linear(layer: RowParallelLinear, x: torch.Tensor) -> torch.Tensor:
+    if not _v4_use_torch_tp_reduce():
         return layer(x)
 
     reduce_results = layer.reduce_results
@@ -2096,7 +2108,7 @@ class MoE(nn.Module):
         if shared is not None:
             routed = routed + shared
         if self.tp_size > 1:
-            if _V4_TP_REDUCE_BACKEND == "torch":
+            if _v4_use_torch_tp_reduce():
                 routed = _v4_torch_tp_all_reduce(routed)
             else:
                 routed = tensor_model_parallel_all_reduce(routed)
