@@ -119,6 +119,7 @@ _V4_TP_REDUCE_BACKEND = os.environ.get(
 _V4_SYNC_PREFILL_TP_REDUCE = (
     os.environ.get("ATOM_DSV4_SYNC_PREFILL_TP_REDUCE", "1") == "1"
 )
+_V4_TP_REDUCE_FP32 = os.environ.get("ATOM_DSV4_TP_REDUCE_FP32", "1") == "1"
 _V4_PREFILL_DIAG = os.environ.get("ATOM_DSV4_PREFILL_DIAG", "0") == "1"
 _V4_PREFILL_DIAG_LAYER_SPEC = os.environ.get(
     "ATOM_DSV4_PREFILL_DIAG_LAYERS", "all"
@@ -166,6 +167,10 @@ def _v4_torch_tp_all_reduce(
     x: torch.Tensor, *, input_is_prepared: bool = False
 ) -> torch.Tensor:
     y = x if input_is_prepared else _v4_prepare_tp_reduce_tensor(x)
+    out_dtype = y.dtype
+    if _V4_TP_REDUCE_FP32 and y.dtype in (torch.float16, torch.bfloat16):
+        y = y.float()
+        _v4_sync_prefill_tp_reduce()
     # The default blocking API can still expose CUDA stream timing here: the
     # next ATOM kernels may consume partially reduced rows under high prefill
     # concurrency. Waiting on the Work object makes the completion boundary
@@ -176,7 +181,7 @@ def _v4_torch_tp_all_reduce(
         async_op=True,
     )
     work.wait()
-    return y
+    return y.to(out_dtype) if y.dtype != out_dtype else y
 
 
 def _v4_aiter_tp_all_reduce(
@@ -534,7 +539,8 @@ def _v4_row_parallel_linear(
                 f"tp_size={getattr(layer, 'tp_size', None)} "
                 f"tp_dim={getattr(layer, 'tp_dim', None)} "
                 f"reduce_results={reduce_results} "
-                f"backend={_V4_TP_REDUCE_BACKEND}",
+                f"backend={_V4_TP_REDUCE_BACKEND} "
+                f"fp32_reduce={_V4_TP_REDUCE_FP32}",
                 flush=True,
             )
         y_local = layer(x)
@@ -544,7 +550,12 @@ def _v4_row_parallel_linear(
     # Diagnostics may replay GEMMs below. Some AITER GEMM paths can reuse
     # output backing storage, so preserve the tensor that the TP collective
     # should consume before launching any diagnostic replay kernels.
-    y_reduce_input = (
+    y_torch_input = (
+        _v4_prepare_tp_reduce_tensor(y_local)
+        if diag_active and reduce_needed
+        else None
+    )
+    y_aiter_input = (
         _v4_prepare_tp_reduce_tensor(y_local)
         if diag_active and reduce_needed
         else None
@@ -562,11 +573,11 @@ def _v4_row_parallel_linear(
             layer_id=layer_id,
         )
     if reduce_needed:
-        reduce_input = y_reduce_input if y_reduce_input is not None else y_local
-        input_is_prepared = y_reduce_input is not None
+        torch_input = y_torch_input if y_torch_input is not None else y_local
+        torch_input_is_prepared = y_torch_input is not None
         if use_torch_reduce or diag_active:
             y_torch = _v4_torch_tp_all_reduce(
-                reduce_input, input_is_prepared=input_is_prepared
+                torch_input, input_is_prepared=torch_input_is_prepared
             )
             if diag_active:
                 _v4_prefill_diag_check(
@@ -575,7 +586,7 @@ def _v4_row_parallel_linear(
                 _v4_prefill_diag_pair_check(
                     f"{diag_label}.torch_reduce_minus_local",
                     y_torch,
-                    reduce_input,
+                    torch_input,
                     input_ids,
                     layer_id,
                 )
@@ -583,8 +594,10 @@ def _v4_row_parallel_linear(
             y_torch = None
         y_aiter = None
         if (not use_torch_reduce) or diag_active:
+            aiter_input = y_aiter_input if y_aiter_input is not None else y_local
+            aiter_input_is_prepared = y_aiter_input is not None
             y_aiter = _v4_aiter_tp_all_reduce(
-                reduce_input, input_is_prepared=input_is_prepared
+                aiter_input, input_is_prepared=aiter_input_is_prepared
             )
             if diag_active:
                 _v4_prefill_diag_check(
