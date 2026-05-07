@@ -382,6 +382,116 @@ def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
     )
 
 
+def _v4_prefill_diag_sequence_rows(
+    label: str, seq_rows: torch.Tensor, tol: float
+) -> None:
+    """Compare full per-request sequences for an identical-prompt prefill batch.
+
+    `_v4_prefill_diag_check` intentionally compares only the last token per
+    request. Sparse attention's last query gathers the whole prefix, so a
+    non-last-token KV corruption can otherwise look like a sparse gather bug.
+    """
+    rows_f = seq_rows.detach().float()
+    if rows_f.dim() < 2 or rows_f.size(0) < 2:
+        return
+    bs = rows_f.size(0)
+    seqlen = rows_f.size(1)
+    diff = (rows_f - rows_f[0:1]).abs()
+    token_max = diff.reshape(bs, seqlen, -1).amax(dim=2)
+    row_max = token_max.amax(dim=1)
+    bad_rows = int((row_max > tol).sum().item())
+    if not _V4_PREFILL_DIAG_VERBOSE and bad_rows == 0:
+        return
+    max_abs = float(diff.max().item()) if diff.numel() else 0.0
+    mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
+    bad = (token_max > tol).nonzero()
+    if bad.numel():
+        first_bad_row = int(bad[0, 0].item())
+        first_bad_tok = int(bad[0, 1].item())
+        bad_tokens_per_row = (token_max > tol).sum(dim=1).detach().cpu().tolist()
+    else:
+        first_bad_row = -1
+        first_bad_tok = -1
+        bad_tokens_per_row = [0] * bs
+    print(
+        "[DSv4 prefill diag] "
+        f"rank={_v4_prefill_diag_rank()} {label}: "
+        f"shape={tuple(seq_rows.shape)} max_abs={max_abs:.6g} "
+        f"mean_abs={mean_abs:.6g} bad_rows={bad_rows}/{bs} "
+        f"first_bad_row={first_bad_row} first_bad_tok={first_bad_tok} "
+        f"bad_tokens_head={bad_tokens_per_row[:8]}",
+        flush=True,
+    )
+
+
+def _v4_prefill_diag_check_all_tokens(
+    label: str,
+    tensor: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int] = None,
+) -> None:
+    if not _v4_prefill_diag_layer_enabled(layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    try:
+        view = tensor.detach()
+        if view.size(0) != total:
+            return
+        rows = view.reshape(bs, seqlen, -1)
+        _v4_prefill_diag_sequence_rows(
+            label, rows, _V4_PREFILL_DIAG_TOL
+        )
+    except Exception as exc:
+        print(f"[DSv4 prefill diag] {label}: all-token check failed: {exc!r}", flush=True)
+
+
+def _v4_prefill_diag_compare_compressed_segments(
+    label: str,
+    tensor: Optional[torch.Tensor],
+    cu_compress_cpu: Optional[Any],
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+) -> Optional[torch.Tensor]:
+    """Compare per-sequence compressed segments for identical-prompt batches.
+
+    Returns a stacked `[bs, n_compress, ...]` view/copy when every sequence has
+    the same compressed count, so callers can compare packed destinations against
+    the original source segments without reconstructing the CPU plan again.
+    """
+    if tensor is None or cu_compress_cpu is None:
+        return None
+    if not _v4_prefill_diag_layer_enabled(layer_id):
+        return None
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return None
+    bs, _, _ = batch
+    try:
+        counts = [
+            int(cu_compress_cpu[i + 1]) - int(cu_compress_cpu[i]) for i in range(bs)
+        ]
+        if not counts or len(set(counts)) != 1 or counts[0] <= 0:
+            return None
+        n = counts[0]
+        segments = []
+        for i in range(bs):
+            start = int(cu_compress_cpu[i])
+            end = start + n
+            segments.append(tensor.detach()[start:end])
+        stacked = torch.stack(segments, dim=0)
+        _v4_prefill_diag_sequence_rows(label, stacked, _V4_PREFILL_DIAG_TOL)
+        return stacked
+    except Exception as exc:
+        print(
+            f"[DSv4 prefill diag] {label}: compressed-segment check failed: {exc!r}",
+            flush=True,
+        )
+        return None
+
+
 def _v4_prefill_diag_pair_rows(
     label: str, lhs_rows: torch.Tensor, rhs_rows: torch.Tensor, tol: float
 ) -> None:
@@ -486,6 +596,77 @@ def _v4_prefill_diag_row_parallel_replay(
         )
     finally:
         layer.reduce_results = reduce_results
+
+
+def _v4_prefill_diag_column_parallel_replay(
+    *,
+    layer: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    diag_label: str,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+) -> None:
+    x_info = _v4_prefill_diag_select_rows(x, input_ids)
+    y_info = _v4_prefill_diag_select_rows(y, input_ids)
+    if x_info is None or y_info is None:
+        return
+    x_rows, bs, _ = x_info
+    y_rows, _, _ = y_info
+    n = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+    x_sample = x_rows[:n].contiguous()
+    try:
+        replay = layer(x_sample).float()
+        _v4_prefill_diag_rows(
+            f"{diag_label}.replay_last_rows",
+            replay,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair_rows(
+            f"{diag_label}.actual_vs_replay",
+            y_rows[:n].float(),
+            replay,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        replay_same = layer(x_rows[0:1].expand(n, -1).contiguous()).float()
+        _v4_prefill_diag_rows(
+            f"{diag_label}.replay_row0_repeated",
+            replay_same,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        if getattr(layer, "quant_type", None) == QuantType.per_1x128:
+            try:
+                w_ref = _dequant_fp8_block_to_bf16(layer.weight, layer.weight_scale)
+                ref = F.linear(x_sample.to(w_ref.dtype), w_ref).float()
+                ref_same = F.linear(
+                    x_rows[0:1].expand(n, -1).contiguous().to(w_ref.dtype),
+                    w_ref,
+                ).float()
+                if getattr(layer, "bias", None) is not None:
+                    ref = ref + layer.bias.float()
+                    ref_same = ref_same + layer.bias.float()
+                _v4_prefill_diag_rows(
+                    f"{diag_label}.dequant_ref_last_rows",
+                    ref,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{diag_label}.dequant_ref_row0_repeated",
+                    ref_same,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+            except Exception as ref_exc:
+                print(
+                    "[DSv4 linear diag] "
+                    f"rank={_v4_prefill_diag_rank()} {diag_label}.dequant_ref failed: {ref_exc!r}",
+                    flush=True,
+                )
+    except Exception as exc:
+        print(
+            "[DSv4 linear diag] "
+            f"rank={_v4_prefill_diag_rank()} {diag_label}.replay failed: {exc!r}",
+            flush=True,
+        )
 
 
 def _v4_row_parallel_linear(
@@ -696,7 +877,10 @@ def _v4_prefill_diag_sparse_inputs(
     layer_id: int,
     ratio: int,
     q_sa: torch.Tensor,
+    kv_source: torch.Tensor,
     kv_sa: torch.Tensor,
+    kv_compress_batched: Optional[torch.Tensor],
+    cu_compress_cpu: Optional[Any],
     topk_flat: torch.Tensor,
     topk_starts: torch.Tensor,
     topk_lens: torch.Tensor,
@@ -763,6 +947,18 @@ def _v4_prefill_diag_sparse_inputs(
         )
 
         _v4_prefill_diag_rows(f"L{layer_id}.sparse.q_last", q_last, _V4_PREFILL_DIAG_TOL)
+        q_seq = q_sa[:total].reshape(bs, seqlen, *q_sa.shape[1:])
+        _v4_prefill_diag_sequence_rows(
+            f"L{layer_id}.sparse.q_all_tokens",
+            q_seq,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_check_all_tokens(
+            f"L{layer_id}.sparse.kv_source_all_tokens",
+            kv_source,
+            input_ids,
+            layer_id,
+        )
         _v4_prefill_diag_rows(
             f"L{layer_id}.sparse.local_topk_last",
             local,
@@ -793,6 +989,90 @@ def _v4_prefill_diag_sparse_inputs(
             f"bad_rows={kv_bad_rows}/{bs} common_valid={int(common_valid.sum().item())}",
             flush=True,
         )
+        window_mask = common_valid & (local >= 0) & (local < seqlen)
+        if bool(window_mask.any().item()):
+            window_diff = torch.where(
+                window_mask[:, :, None], kv_diff, torch.zeros_like(kv_diff)
+            )
+            window_row_max = window_diff.reshape(bs, -1).amax(dim=1)
+            print(
+                "[DSv4 sparse diag] "
+                f"rank={_v4_prefill_diag_rank()} L{layer_id}.sparse.kv_gather_window_last: "
+                f"max_abs={float(window_diff.max().item()):.6g} "
+                f"bad_rows={int((window_row_max > _V4_PREFILL_DIAG_TOL).sum().item())}/{bs} "
+                f"common_valid={int(window_mask.sum().item())}",
+                flush=True,
+            )
+        compress_mask = common_valid & (local >= seqlen)
+        if bool(compress_mask.any().item()):
+            compress_diff = torch.where(
+                compress_mask[:, :, None], kv_diff, torch.zeros_like(kv_diff)
+            )
+            compress_row_max = compress_diff.reshape(bs, -1).amax(dim=1)
+            print(
+                "[DSv4 sparse diag] "
+                f"rank={_v4_prefill_diag_rank()} L{layer_id}.sparse.kv_gather_compress_last: "
+                f"max_abs={float(compress_diff.max().item()):.6g} "
+                f"bad_rows={int((compress_row_max > _V4_PREFILL_DIAG_TOL).sum().item())}/{bs} "
+                f"common_valid={int(compress_mask.sum().item())}",
+                flush=True,
+            )
+        # Compare the raw per-seq prefix region that backs the window gather.
+        # For fresh prefill this is the first `seqlen` KV rows in every
+        # sequence's ragged `kv_sa` segment.
+        seq_offsets = kv_offsets.index_select(0, last_rows).long()
+        prefix_arange = torch.arange(seqlen, device=device, dtype=torch.long)
+        prefix_idx = seq_offsets.view(-1, 1) + prefix_arange.view(1, -1)
+        valid_prefix = (prefix_idx >= 0) & (prefix_idx < kv_sa.size(0))
+        safe_prefix = torch.where(valid_prefix, prefix_idx, torch.zeros_like(prefix_idx))
+        kv_prefix = kv_sa.index_select(0, safe_prefix.reshape(-1)).reshape(
+            bs, seqlen, kv_sa.size(-1)
+        )
+        _v4_prefill_diag_sequence_rows(
+            f"L{layer_id}.sparse.kv_prefix_all_tokens",
+            kv_prefix,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        kv_source_seq = (
+            kv_source[:total].detach().reshape(bs, seqlen, kv_source.size(-1))
+        )
+        _v4_prefill_diag_pair_rows(
+            f"L{layer_id}.sparse.kv_prefix_minus_source",
+            kv_prefix,
+            kv_source_seq,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        source_compress = _v4_prefill_diag_compare_compressed_segments(
+            f"L{layer_id}.sparse.kv_compress_source_by_seq",
+            kv_compress_batched,
+            cu_compress_cpu,
+            input_ids,
+            layer_id,
+        )
+        if source_compress is not None:
+            n_comp = source_compress.size(1)
+            comp_arange = torch.arange(n_comp, device=device, dtype=torch.long)
+            comp_idx = (
+                seq_offsets.view(-1, 1)
+                + seqlen
+                + comp_arange.view(1, -1)
+            )
+            valid_comp = (comp_idx >= 0) & (comp_idx < kv_sa.size(0))
+            safe_comp = torch.where(valid_comp, comp_idx, torch.zeros_like(comp_idx))
+            kv_tail = kv_sa.index_select(0, safe_comp.reshape(-1)).reshape(
+                bs, n_comp, kv_sa.size(-1)
+            )
+            _v4_prefill_diag_sequence_rows(
+                f"L{layer_id}.sparse.kv_tail_compress_by_seq",
+                kv_tail,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_pair_rows(
+                f"L{layer_id}.sparse.kv_tail_minus_compress_source",
+                kv_tail,
+                source_compress,
+                _V4_PREFILL_DIAG_TOL,
+            )
     except Exception as exc:
         print(
             f"[DSv4 sparse diag] rank={_v4_prefill_diag_rank()} "
@@ -2370,6 +2650,12 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.input_normed_all_tokens",
+                x,
+                input_ids,
+                self.layer_id,
+            )
 
         # Idempotent one-time plumb of rotary_emb into compressor / indexer
         # (and the indexer's inner compressor). `rotary_emb` is set by the
@@ -2396,8 +2682,20 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.q_lora_all_tokens",
+                q_lora,
+                input_ids,
+                self.layer_id,
+            )
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.kv_pre",
+                kv_pre,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.kv_pre_all_tokens",
                 kv_pre,
                 input_ids,
                 self.layer_id,
@@ -2406,6 +2704,12 @@ class DeepseekV4Attention(nn.Module):
         if deep_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.qr_norm",
+                qr,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.qr_norm_all_tokens",
                 qr,
                 input_ids,
                 self.layer_id,
@@ -2421,10 +2725,22 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.q_proj_all_tokens",
+                q,
+                input_ids,
+                self.layer_id,
+            )
         q = _rmsnorm_nw(q, self.eps, self.head_dim)
         if deep_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.q_head_norm",
+                q,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.q_head_norm_all_tokens",
                 q,
                 input_ids,
                 self.layer_id,
@@ -2439,6 +2755,18 @@ class DeepseekV4Attention(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.kv_norm_all_tokens",
+                kv,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.positions_all_tokens",
+                positions.view(-1, 1).to(kv.dtype),
+                input_ids,
+                self.layer_id,
+            )
         self.rotary_emb(positions, q[..., -rd:], kv[..., -rd:])
         if deep_diag:
             _v4_prefill_diag_check(
@@ -2449,6 +2777,18 @@ class DeepseekV4Attention(nn.Module):
             )
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn.kv_post_rope",
+                kv,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.q_post_rope_all_tokens",
+                q,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn.kv_post_rope_all_tokens",
                 kv,
                 input_ids,
                 self.layer_id,
@@ -2626,7 +2966,14 @@ class DeepseekV4Attention(nn.Module):
                     layer_id=self.layer_id,
                     ratio=ratio,
                     q_sa=q_sa,
+                    kv_source=kv,
                     kv_sa=kv_sa,
+                    kv_compress_batched=kv_compress_batched,
+                    cu_compress_cpu=(
+                        plan_for_layer.cu_compress_cpu
+                        if plan_for_layer is not None
+                        else None
+                    ),
                     topk_flat=topk_flat,
                     topk_starts=topk_starts,
                     topk_lens=topk_lens,
@@ -2833,15 +3180,40 @@ class Expert(nn.Module):
         layer_id: Optional[int] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         dtype = x.dtype
+        if diag_label is not None and input_ids is not None:
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.input_all_tokens",
+                x,
+                input_ids,
+                layer_id,
+            )
         # Single fused GEMM, then chunk(2) along last dim so TP-sharded per-rank
         # output (inter_dim_per_tp * 2) is split correctly regardless of tp_size.
         combined = self.gate_up_proj(x).float()  # [num_tokens, 2*inter_dim_per_tp]
         if diag_label is not None and input_ids is not None:
+            # Diagnostic replay launches the same GEMM again. Keep the tensor used
+            # by the real forward on independent storage in case a backend uses a
+            # reusable workspace for returned outputs.
+            combined = combined.clone()
             _v4_prefill_diag_check(
                 f"{diag_label}.gate_up",
                 combined,
                 input_ids,
                 layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.gate_up_all_tokens",
+                combined,
+                input_ids,
+                layer_id,
+            )
+            _v4_prefill_diag_column_parallel_replay(
+                layer=self.gate_up_proj,
+                x=x,
+                y=combined,
+                diag_label=f"{diag_label}.gate_up",
+                input_ids=input_ids,
+                layer_id=layer_id,
             )
         gate, up = combined.chunk(2, dim=-1)  # each [num_tokens, inter_dim_per_tp]
         if self.swiglu_limit > 0:
@@ -2851,6 +3223,12 @@ class Expert(nn.Module):
         if diag_label is not None and input_ids is not None:
             _v4_prefill_diag_check(
                 f"{diag_label}.act",
+                x,
+                input_ids,
+                layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.act_all_tokens",
                 x,
                 input_ids,
                 layer_id,
@@ -3213,16 +3591,23 @@ class MoE(nn.Module):
         # a stale reference across forwards.
         if self.is_hash_layer:
             self._hash_input_ids = input_ids
-        if self._use_dual_stream and not _v4_prefill_diag_ref_active(
-            input_ids, self.layer_id
-        ):
+        diag_active = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
+        if self._use_dual_stream and not diag_active:
             # Shared custom op (also used by V2). Dispatcher reads
             # `_use_dual_stream` + per-call num_tokens vs threshold to pick
             # dual vs single. Custom op = Dynamo barrier so stream context
             # inside `dual_stream_moe_forward` is opaque to torch.compile.
             y = torch.ops.aiter.maybe_dual_stream_forward(x, self.prefix)
         elif self._use_dual_stream:
-            y = self.dual_stream_moe_forward(x, input_ids)
+            # Keep diagnostics on the same stream path as production. The custom
+            # op chooses single-stream when num_tokens exceeds the threshold; do
+            # not force large-prefill diagnostics onto dual-stream or the probe
+            # can create a false shared-expert failure.
+            threshold = envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+            if 0 < x.shape[0] <= threshold:
+                y = self.dual_stream_moe_forward(x, input_ids)
+            else:
+                y = self.single_stream_moe_forward(x, input_ids)
         else:
             y = self.single_stream_moe_forward(x, input_ids)
         if self.is_hash_layer:
@@ -3535,10 +3920,22 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn_hc_pre_all_tokens",
+                x,
+                input_ids,
+                self.layer_id,
+            )
         x = self.ffn_norm(x)  # [num_tokens, dim]
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_norm",
+                x,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn_norm_all_tokens",
                 x,
                 input_ids,
                 self.layer_id,
