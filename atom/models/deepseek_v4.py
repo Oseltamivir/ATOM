@@ -3820,13 +3820,17 @@ class Block(nn.Module):
     ]:
         dtype = residual.dtype
         x_mhc = residual
+        shape = x_mhc.size()
         x_flat = x_mhc.flatten(-2).float()  # [num_tokens, hc*dim]
+        # DSv4 mHC-pre uses the reference FP32 row-RMS form. Do not use
+        # _rmsnorm_nw here: the hc_dim=4*7168=28672 path breaks identical-row
+        # invariance under high-concurrency prefill.
         rsqrt = torch.rsqrt(
             x_flat.square().mean(-1, keepdim=True) + self.norm_eps
         )
-        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1]).float()
-        mixes_linear = F.linear(x_normed, hc_fn)  # [num_tokens, mix_hc]
-        mixes = mixes_linear
+        x_normed = x_flat * rsqrt
+        mixes_linear = F.linear(x_flat, hc_fn)  # [num_tokens, mix_hc]
+        mixes = mixes_linear * rsqrt
         diag_layer_id = self.layer_id if layer_id is None else layer_id
         if (
             diag_label is not None
@@ -3871,7 +3875,7 @@ class Block(nn.Module):
             )
             _v4_prefill_diag_hc_pre_token_replay(
                 diag_label,
-                x_for_linear=x_normed,
+                x_for_linear=x_flat,
                 mixes_linear=mixes_linear,
                 hc_fn=hc_fn,
                 input_ids=input_ids,
@@ -3886,7 +3890,7 @@ class Block(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
-        y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
+        y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
         return y.to(dtype), mixes, pre, post, comb
 
     def hc_pre(
