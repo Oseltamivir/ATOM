@@ -117,6 +117,7 @@ _V4_TP_REDUCE_BACKEND = os.environ.get(
     os.environ.get("ATOM_DSV4_WO_B_REDUCE_BACKEND", "aiter"),
 ).lower()
 _V4_MHC_PRE_BACKEND = os.environ.get("ATOM_DSV4_MHC_PRE_BACKEND", "fused").lower()
+_V4_MHC_REPLAY_TOKEN = int(os.environ.get("ATOM_DSV4_MHC_REPLAY_TOKEN", "13"))
 _V4_SYNC_PREFILL_TP_REDUCE = (
     os.environ.get("ATOM_DSV4_SYNC_PREFILL_TP_REDUCE", "1") == "1"
 )
@@ -496,6 +497,70 @@ def _v4_prefill_diag_mhc_coeffs(
             y.reshape(y.size(0), -1),
             input_ids,
             layer_id,
+        )
+
+
+def _v4_prefill_diag_hc_pre_token_replay(
+    label: str,
+    *,
+    x_for_linear: torch.Tensor,
+    mixes_linear: torch.Tensor,
+    hc_fn: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+    token_idx: int,
+) -> None:
+    if not _v4_prefill_diag_ref_active(input_ids, layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, _ = batch
+    if token_idx < 0 or token_idx >= seqlen:
+        return
+    try:
+        rows = (
+            torch.arange(bs, device=x_for_linear.device, dtype=torch.long) * seqlen
+            + token_idx
+        )
+        x_tok = x_for_linear.index_select(0, rows).contiguous()
+        actual_tok = mixes_linear.index_select(0, rows).float()
+        replay_tok = F.linear(x_tok.float(), hc_fn.float()).float()
+        replay_same = F.linear(
+            x_tok[0:1].expand_as(x_tok).contiguous().float(),
+            hc_fn.float(),
+        ).float()
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.x_for_linear",
+            x_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.actual_mixes_linear",
+            actual_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.replay_mixes_linear",
+            replay_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.replay_row0_repeated",
+            replay_same,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair_rows(
+            f"{label}.token{token_idx}.actual_minus_replay",
+            actual_tok,
+            replay_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+    except Exception as exc:
+        print(
+            "[DSv4 prefill diag] "
+            f"rank={_v4_prefill_diag_rank()} {label}.token{token_idx}.replay failed: {exc!r}",
+            flush=True,
         )
 
 
@@ -3742,6 +3807,10 @@ class Block(nn.Module):
         hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
         hc_scale: torch.Tensor,  # [3] fp32
         hc_base: torch.Tensor,  # [mix_hc] fp32
+        *,
+        diag_label: Optional[str] = None,
+        input_ids: Optional[torch.Tensor] = None,
+        layer_id: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -3750,9 +3819,65 @@ class Block(nn.Module):
         torch.Tensor,
     ]:
         dtype = residual.dtype
-        x_flat = residual.flatten(-2)  # [num_tokens, hc*dim]
-        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
-        mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, mix_hc]
+        x_mhc = residual
+        x_flat = x_mhc.flatten(-2).float()  # [num_tokens, hc*dim]
+        rsqrt = torch.rsqrt(
+            x_flat.square().mean(-1, keepdim=True) + self.norm_eps
+        )
+        x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1]).float()
+        mixes_linear = F.linear(x_normed, hc_fn)  # [num_tokens, mix_hc]
+        mixes = mixes_linear
+        diag_layer_id = self.layer_id if layer_id is None else layer_id
+        if (
+            diag_label is not None
+            and diag_label.endswith(".ffn_hc_pre")
+            and _v4_prefill_diag_ref_active(input_ids, diag_layer_id)
+        ):
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.input_mhc_all_tokens",
+                x_mhc.reshape(x_mhc.shape[0], -1),
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.x_flat_all_tokens",
+                x_flat,
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.rsqrt_all_tokens",
+                rsqrt,
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.x_normed_all_tokens",
+                x_normed,
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.mixes_linear_all_tokens",
+                mixes_linear,
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.mixes_all_tokens",
+                mixes,
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_hc_pre_token_replay(
+                diag_label,
+                x_for_linear=x_normed,
+                mixes_linear=mixes_linear,
+                hc_fn=hc_fn,
+                input_ids=input_ids,
+                layer_id=diag_layer_id,
+                token_idx=_V4_MHC_REPLAY_TOKEN,
+            )
         pre, post, comb = hc_split_sinkhorn(
             mixes,
             hc_scale,
@@ -3805,34 +3930,17 @@ class Block(nn.Module):
                 diag_label is not None
                 and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
             ):
-                _v4_prefill_diag_mhc_coeffs(
-                    diag_label,
-                    post=post,
-                    comb=comb,
-                    y=y,
-                    input_ids=input_ids,
-                    layer_id=self.layer_id,
-                )
                 try:
-                    y_ref, mixes_ref, pre_ref, post_ref, comb_ref = (
+                    y_ref, _mixes_ref, _pre_ref, post_ref, comb_ref = (
                         self._hc_pre_torch_coeffs(
-                            residual, hc_fn, hc_scale, hc_base
+                            residual,
+                            hc_fn,
+                            hc_scale,
+                            hc_base,
+                            diag_label=diag_label,
+                            input_ids=input_ids,
+                            layer_id=self.layer_id,
                         )
-                    )
-                    _v4_prefill_diag_mhc_coeffs(
-                        diag_label,
-                        mixes=mixes_ref,
-                        pre=pre_ref,
-                        input_ids=input_ids,
-                        layer_id=self.layer_id,
-                    )
-                    _v4_prefill_diag_mhc_coeffs(
-                        f"{diag_label}.torch",
-                        post=post_ref,
-                        comb=comb_ref,
-                        y=y_ref,
-                        input_ids=input_ids,
-                        layer_id=self.layer_id,
                     )
                     _v4_prefill_diag_pair_check(
                         f"{diag_label}.fused_minus_torch_y",
@@ -3865,22 +3973,14 @@ class Block(nn.Module):
 
         # Torch fallback (no-aiter): mirrors the reference math.
         y, mixes, pre, post, comb = self._hc_pre_torch_coeffs(
-            residual, hc_fn, hc_scale, hc_base
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            diag_label=diag_label,
+            input_ids=input_ids,
+            layer_id=self.layer_id,
         )
-        if (
-            diag_label is not None
-            and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
-        ):
-            _v4_prefill_diag_mhc_coeffs(
-                diag_label,
-                mixes=mixes,
-                pre=pre,
-                post=post,
-                comb=comb,
-                y=y,
-                input_ids=input_ids,
-                layer_id=self.layer_id,
-            )
         return y, post, comb
 
     def _hc_post_torch_ref(
@@ -4010,6 +4110,12 @@ class Block(nn.Module):
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_hc_post",
                 x,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.output_all_tokens",
+                x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
                 input_ids,
                 self.layer_id,
             )
