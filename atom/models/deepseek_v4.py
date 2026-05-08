@@ -116,6 +116,7 @@ _V4_TP_REDUCE_BACKEND = os.environ.get(
     "ATOM_DSV4_TP_REDUCE_BACKEND",
     os.environ.get("ATOM_DSV4_WO_B_REDUCE_BACKEND", "aiter"),
 ).lower()
+_V4_MHC_PRE_BACKEND = os.environ.get("ATOM_DSV4_MHC_PRE_BACKEND", "fused").lower()
 _V4_SYNC_PREFILL_TP_REDUCE = (
     os.environ.get("ATOM_DSV4_SYNC_PREFILL_TP_REDUCE", "1") == "1"
 )
@@ -446,6 +447,56 @@ def _v4_prefill_diag_check_all_tokens(
         )
     except Exception as exc:
         print(f"[DSv4 prefill diag] {label}: all-token check failed: {exc!r}", flush=True)
+
+
+def _v4_prefill_diag_mhc_coeffs(
+    label: str,
+    *,
+    mixes: Optional[torch.Tensor] = None,
+    pre: Optional[torch.Tensor] = None,
+    post: Optional[torch.Tensor] = None,
+    comb: Optional[torch.Tensor] = None,
+    y: Optional[torch.Tensor] = None,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+) -> None:
+    if input_ids is None:
+        return
+    if mixes is not None:
+        _v4_prefill_diag_check_all_tokens(
+            f"{label}.mixes_all_tokens",
+            mixes.reshape(mixes.size(0), -1),
+            input_ids,
+            layer_id,
+        )
+    if pre is not None:
+        _v4_prefill_diag_check_all_tokens(
+            f"{label}.pre_all_tokens",
+            pre.reshape(pre.size(0), -1),
+            input_ids,
+            layer_id,
+        )
+    if post is not None:
+        _v4_prefill_diag_check_all_tokens(
+            f"{label}.post_all_tokens",
+            post.reshape(post.size(0), -1),
+            input_ids,
+            layer_id,
+        )
+    if comb is not None:
+        _v4_prefill_diag_check_all_tokens(
+            f"{label}.comb_all_tokens",
+            comb.reshape(comb.size(0), -1),
+            input_ids,
+            layer_id,
+        )
+    if y is not None:
+        _v4_prefill_diag_check_all_tokens(
+            f"{label}.y_all_tokens",
+            y.reshape(y.size(0), -1),
+            input_ids,
+            layer_id,
+        )
 
 
 def _v4_prefill_diag_compare_compressed_segments(
@@ -3680,6 +3731,24 @@ class Block(nn.Module):
         hc_scale: torch.Tensor,  # [3] fp32
         hc_base: torch.Tensor,  # [mix_hc] fp32
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        y, _mixes, _pre, post, comb = self._hc_pre_torch_coeffs(
+            residual, hc_fn, hc_scale, hc_base
+        )
+        return y, post, comb
+
+    def _hc_pre_torch_coeffs(
+        self,
+        residual: torch.Tensor,  # [num_tokens, hc, dim]  mHC-widened residual
+        hc_fn: torch.Tensor,  # [mix_hc, hc*dim]  fp32
+        hc_scale: torch.Tensor,  # [3] fp32
+        hc_base: torch.Tensor,  # [mix_hc] fp32
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         dtype = residual.dtype
         x_flat = residual.flatten(-2)  # [num_tokens, hc*dim]
         x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
@@ -3693,7 +3762,7 @@ class Block(nn.Module):
             self.hc_eps,
         )
         y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
-        return y.to(dtype), post, comb
+        return y.to(dtype), mixes, pre, post, comb
 
     def hc_pre(
         self,
@@ -3717,7 +3786,7 @@ class Block(nn.Module):
           post: [num_tokens, hc]       post-gate weights for hc_post
           comb: [num_tokens, hc, hc]   combination matrix for hc_post
         """
-        if self._mhc_pre is not None:
+        if self._mhc_pre is not None and _V4_MHC_PRE_BACKEND != "torch":
             # aiter mhc_pre wants [M, hc, dim] and returns
             # (post [M, hc, 1], comb [M, hc, hc], y [M, dim]).
             post, comb, y = self._mhc_pre(
@@ -3736,9 +3805,34 @@ class Block(nn.Module):
                 diag_label is not None
                 and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
             ):
+                _v4_prefill_diag_mhc_coeffs(
+                    diag_label,
+                    post=post,
+                    comb=comb,
+                    y=y,
+                    input_ids=input_ids,
+                    layer_id=self.layer_id,
+                )
                 try:
-                    y_ref, post_ref, comb_ref = self._hc_pre_torch_ref(
-                        residual, hc_fn, hc_scale, hc_base
+                    y_ref, mixes_ref, pre_ref, post_ref, comb_ref = (
+                        self._hc_pre_torch_coeffs(
+                            residual, hc_fn, hc_scale, hc_base
+                        )
+                    )
+                    _v4_prefill_diag_mhc_coeffs(
+                        diag_label,
+                        mixes=mixes_ref,
+                        pre=pre_ref,
+                        input_ids=input_ids,
+                        layer_id=self.layer_id,
+                    )
+                    _v4_prefill_diag_mhc_coeffs(
+                        f"{diag_label}.torch",
+                        post=post_ref,
+                        comb=comb_ref,
+                        y=y_ref,
+                        input_ids=input_ids,
+                        layer_id=self.layer_id,
                     )
                     _v4_prefill_diag_pair_check(
                         f"{diag_label}.fused_minus_torch_y",
@@ -3770,7 +3864,24 @@ class Block(nn.Module):
             return y, post, comb
 
         # Torch fallback (no-aiter): mirrors the reference math.
-        return self._hc_pre_torch_ref(residual, hc_fn, hc_scale, hc_base)
+        y, mixes, pre, post, comb = self._hc_pre_torch_coeffs(
+            residual, hc_fn, hc_scale, hc_base
+        )
+        if (
+            diag_label is not None
+            and _v4_prefill_diag_ref_active(input_ids, self.layer_id)
+        ):
+            _v4_prefill_diag_mhc_coeffs(
+                diag_label,
+                mixes=mixes,
+                pre=pre,
+                post=post,
+                comb=comb,
+                y=y,
+                input_ids=input_ids,
+                layer_id=self.layer_id,
+            )
+        return y, post, comb
 
     def _hc_post_torch_ref(
         self,
