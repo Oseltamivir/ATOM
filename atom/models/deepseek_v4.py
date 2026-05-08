@@ -4025,16 +4025,37 @@ class ParallelHead(nn.Module):
         hc_fn: torch.Tensor,  # [hc, hc*dim]  fp32
         hc_scale: torch.Tensor,  # [1] fp32
         hc_base: torch.Tensor,  # [hc] fp32
+        diag_label: Optional[str] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:  # [num_tokens, dim]
         """Reduce mHC residual `[num_tokens, hc, dim]` → `[num_tokens, dim]`
         via Sigmoid-gated weighted sum (vs Block.hc_pre's Sinkhorn variant).
         """
+        diag_active = diag_label is not None and _v4_prefill_diag_layer_enabled(None)
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.input_mhc", x, input_ids)
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.input_mhc_all_tokens", x, input_ids
+            )
         dtype = x.dtype
         x_flat = x.flatten(-2)  # [num_tokens, hc*dim]
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.x_flat", x_flat, input_ids)
         x_normed = _rmsnorm_nw(x_flat, self.norm_eps, x_flat.shape[-1])
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.x_normed", x_normed, input_ids)
         mixes = F.linear(x_normed.float(), hc_fn)  # [num_tokens, hc]
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.mixes", mixes, input_ids)
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.pre", pre, input_ids)
         y = torch.sum(pre.unsqueeze(-1) * x, dim=-2)  # [num_tokens, dim]
+        if diag_active:
+            _v4_prefill_diag_check(f"{diag_label}.y", y, input_ids)
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.y_all_tokens", y, input_ids
+            )
         return y.to(dtype)
 
     def forward(
@@ -4217,7 +4238,12 @@ class DeepseekV4Model(nn.Module):
         # Reduce the mHC residual stack (hc_head + final RMSNorm); leave the
         # vocab projection to compute_logits.
         x_hc = self.head.hc_head(  # [num_tokens, dim]
-            h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
+            h,
+            self.hc_head_fn,
+            self.hc_head_scale,
+            self.hc_head_base,
+            diag_label="model.hc_head",
+            input_ids=input_ids,
         )
         _v4_prefill_diag_check("model.hc_head", x_hc, input_ids)
         out = self.norm(x_hc)
