@@ -939,6 +939,9 @@ def _v4_row_parallel_linear(
     try:
         if diag_active:
             _v4_prefill_diag_check(f"{diag_label}.input", x, input_ids, layer_id)
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.input_all_tokens", x, input_ids, layer_id
+            )
             _v4_prefill_diag_tensor_meta(
                 f"{diag_label}.input_meta", x, layer_id
             )
@@ -984,6 +987,12 @@ def _v4_row_parallel_linear(
         _v4_prefill_diag_check(
             f"{diag_label}.local_no_reduce", y_local, input_ids, layer_id
         )
+        _v4_prefill_diag_check_all_tokens(
+            f"{diag_label}.local_no_reduce_all_tokens",
+            y_local,
+            input_ids,
+            layer_id,
+        )
         _v4_prefill_diag_row_parallel_replay(
             layer=layer,
             x=x,
@@ -1002,6 +1011,12 @@ def _v4_row_parallel_linear(
             if diag_active:
                 _v4_prefill_diag_check(
                     f"{diag_label}.torch_reduce", y_torch, input_ids, layer_id
+                )
+                _v4_prefill_diag_check_all_tokens(
+                    f"{diag_label}.torch_reduce_all_tokens",
+                    y_torch,
+                    input_ids,
+                    layer_id,
                 )
                 _v4_prefill_diag_pair_check(
                     f"{diag_label}.torch_reduce_minus_local",
@@ -1023,6 +1038,12 @@ def _v4_row_parallel_linear(
                 _v4_prefill_diag_check(
                     f"{diag_label}.aiter_reduce", y_aiter, input_ids, layer_id
                 )
+                _v4_prefill_diag_check_all_tokens(
+                    f"{diag_label}.aiter_reduce_all_tokens",
+                    y_aiter,
+                    input_ids,
+                    layer_id,
+                )
                 if y_torch is not None:
                     _v4_prefill_diag_pair_check(
                         f"{diag_label}.aiter_minus_torch_reduce",
@@ -1037,6 +1058,9 @@ def _v4_row_parallel_linear(
         y = y_local
     if diag_active:
         _v4_prefill_diag_check(f"{diag_label}.result", y, input_ids, layer_id)
+        _v4_prefill_diag_check_all_tokens(
+            f"{diag_label}.result_all_tokens", y, input_ids, layer_id
+        )
     return y
 
 
@@ -3662,6 +3686,12 @@ class MoE(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn.router_logits_all_tokens",
+                router_logits,
+                input_ids,
+                self.layer_id,
+            )
             try:
                 topk_weights, topk_ids = FusedMoE.select_experts(
                     hidden_states=x,
@@ -3682,8 +3712,20 @@ class MoE(nn.Module):
                     input_ids,
                     self.layer_id,
                 )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.topk_weights_all_tokens",
+                    topk_weights,
+                    input_ids,
+                    self.layer_id,
+                )
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.topk_ids",
+                    topk_ids.float(),
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.topk_ids_all_tokens",
                     topk_ids.float(),
                     input_ids,
                     self.layer_id,
@@ -3698,6 +3740,12 @@ class MoE(nn.Module):
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.routed_local",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn.routed_local_all_tokens",
                 routed,
                 input_ids,
                 self.layer_id,
@@ -3721,9 +3769,21 @@ class MoE(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn.routed_pre_combine_all_tokens",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
             if shared is not None:
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.shared_local",
+                    shared,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.shared_local_all_tokens",
                     shared,
                     input_ids,
                     self.layer_id,
@@ -3733,6 +3793,12 @@ class MoE(nn.Module):
             if diag_enabled:
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.routed_plus_shared",
+                    routed,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.routed_plus_shared_all_tokens",
                     routed,
                     input_ids,
                     self.layer_id,
@@ -3748,8 +3814,20 @@ class MoE(nn.Module):
                     input_ids,
                     self.layer_id,
                 )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.torch_reduce_all_tokens",
+                    torch_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.aiter_reduce",
+                    aiter_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_check_all_tokens(
+                    f"L{self.layer_id}.ffn.aiter_reduce_all_tokens",
                     aiter_reduced,
                     input_ids,
                     self.layer_id,
@@ -3769,6 +3847,12 @@ class MoE(nn.Module):
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.combined_result",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn.combined_result_all_tokens",
                 routed,
                 input_ids,
                 self.layer_id,
