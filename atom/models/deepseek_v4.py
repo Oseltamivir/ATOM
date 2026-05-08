@@ -133,6 +133,9 @@ _V4_PREFILL_DIAG_VERBOSE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_VERBOSE", "0") == "1"
 )
 _V4_PREFILL_DIAG_TOL = float(os.environ.get("ATOM_DSV4_PREFILL_DIAG_TOL", "1e-3"))
+_V4_PREFILL_DIAG_HC_TOL = float(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_HC_TOL", "1e-5")
+)
 _V4_PREFILL_DIAG_SPARSE_COMPARE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_SPARSE_COMPARE", "1") == "1"
 )
@@ -431,6 +434,7 @@ def _v4_prefill_diag_check_all_tokens(
     tensor: torch.Tensor,
     input_ids: Optional[torch.Tensor],
     layer_id: Optional[int] = None,
+    tol: Optional[float] = None,
 ) -> None:
     if not _v4_prefill_diag_layer_enabled(layer_id):
         return
@@ -444,7 +448,7 @@ def _v4_prefill_diag_check_all_tokens(
             return
         rows = view.reshape(bs, seqlen, -1)
         _v4_prefill_diag_sequence_rows(
-            label, rows, _V4_PREFILL_DIAG_TOL
+            label, rows, _V4_PREFILL_DIAG_TOL if tol is None else tol
         )
     except Exception as exc:
         print(f"[DSv4 prefill diag] {label}: all-token check failed: {exc!r}", flush=True)
@@ -554,6 +558,93 @@ def _v4_prefill_diag_hc_pre_token_replay(
             f"{label}.token{token_idx}.actual_minus_replay",
             actual_tok,
             replay_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+    except Exception as exc:
+        print(
+            "[DSv4 prefill diag] "
+            f"rank={_v4_prefill_diag_rank()} {label}.token{token_idx}.replay failed: {exc!r}",
+            flush=True,
+        )
+
+
+def _v4_prefill_diag_hc_post_token_replay(
+    label: str,
+    *,
+    attn_out: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_post_module: Any,
+    actual: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+    token_idx: int,
+) -> None:
+    if not _v4_prefill_diag_ref_active(input_ids, layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, _ = batch
+    if token_idx < 0 or token_idx >= seqlen:
+        return
+    try:
+        rows = (
+            torch.arange(bs, device=actual.device, dtype=torch.long) * seqlen
+            + token_idx
+        )
+        a_tok = attn_out.index_select(0, rows).contiguous()
+        r_tok = residual.index_select(0, rows).contiguous()
+        p_tok = post.index_select(0, rows).contiguous()
+        c_tok = comb.index_select(0, rows).contiguous()
+        y_tok = actual.index_select(0, rows).contiguous()
+        replay = hc_post_module(a_tok, r_tok, p_tok, c_tok)
+        replay_same = hc_post_module(
+            a_tok[0:1].expand_as(a_tok).contiguous(),
+            r_tok[0:1].expand_as(r_tok).contiguous(),
+            p_tok[0:1].expand_as(p_tok).contiguous(),
+            c_tok[0:1].expand_as(c_tok).contiguous(),
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.attn_out",
+            a_tok,
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.residual",
+            r_tok.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.post",
+            p_tok.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.comb",
+            c_tok.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.actual",
+            y_tok.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.replay",
+            replay.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_rows(
+            f"{label}.token{token_idx}.replay_row0_repeated",
+            replay_same.reshape(bs, -1),
+            _V4_PREFILL_DIAG_TOL,
+        )
+        _v4_prefill_diag_pair_rows(
+            f"{label}.token{token_idx}.actual_minus_replay",
+            y_tok.reshape(bs, -1),
+            replay.reshape(bs, -1),
             _V4_PREFILL_DIAG_TOL,
         )
     except Exception as exc:
@@ -3834,6 +3925,23 @@ class Block(nn.Module):
         diag_layer_id = self.layer_id if layer_id is None else layer_id
         if (
             diag_label is not None
+            and diag_label.endswith(".attn_hc_pre")
+            and _v4_prefill_diag_ref_active(input_ids, diag_layer_id)
+        ):
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.input_mhc_all_tokens",
+                x_mhc.reshape(x_mhc.shape[0], -1),
+                input_ids,
+                diag_layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"{diag_label}.x_flat_all_tokens",
+                x_flat,
+                input_ids,
+                diag_layer_id,
+            )
+        if (
+            diag_label is not None
             and diag_label.endswith(".ffn_hc_pre")
             and _v4_prefill_diag_ref_active(input_ids, diag_layer_id)
         ):
@@ -3891,6 +3999,20 @@ class Block(nn.Module):
             self.hc_eps,
         )
         y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=1)
+        if (
+            diag_label is not None
+            and diag_label.endswith(".attn_hc_pre")
+            and _v4_prefill_diag_ref_active(input_ids, diag_layer_id)
+        ):
+            _v4_prefill_diag_mhc_coeffs(
+                diag_label,
+                pre=pre,
+                post=post,
+                comb=comb,
+                y=y,
+                input_ids=input_ids,
+                layer_id=diag_layer_id,
+            )
         return y.to(dtype), mixes, pre, post, comb
 
     def hc_pre(
@@ -4069,6 +4191,13 @@ class Block(nn.Module):
             )
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
+        if layer_diag:
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_pre.residual_input_all_tokens",
+                x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
+                input_ids,
+                self.layer_id,
+            )
         x, post, comb = (
             self.hc_pre(  # [num_tokens, dim], [num_tokens, hc], [num_tokens, hc, hc]
                 x,
@@ -4102,6 +4231,66 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.attn_out_input_all_tokens",
+                x,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.attn_out_input_all_tokens_hctol",
+                x,
+                input_ids,
+                self.layer_id,
+                tol=_V4_PREFILL_DIAG_HC_TOL,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.residual_input_all_tokens",
+                residual.reshape(residual.shape[0], -1)
+                if residual.dim() == 3
+                else residual,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.residual_input_all_tokens_hctol",
+                residual.reshape(residual.shape[0], -1)
+                if residual.dim() == 3
+                else residual,
+                input_ids,
+                self.layer_id,
+                tol=_V4_PREFILL_DIAG_HC_TOL,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.post_input_all_tokens",
+                post.reshape(post.shape[0], -1),
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.post_input_all_tokens_hctol",
+                post.reshape(post.shape[0], -1),
+                input_ids,
+                self.layer_id,
+                tol=_V4_PREFILL_DIAG_HC_TOL,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.comb_input_all_tokens",
+                comb.reshape(comb.shape[0], -1),
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.comb_input_all_tokens_hctol",
+                comb.reshape(comb.shape[0], -1),
+                input_ids,
+                self.layer_id,
+                tol=_V4_PREFILL_DIAG_HC_TOL,
+            )
+        attn_out_for_diag = x
+        residual_for_diag = residual
+        post_for_diag = post
+        comb_for_diag = comb
         x = self.hc_post(
             x,
             residual,
@@ -4122,6 +4311,25 @@ class Block(nn.Module):
                 x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
                 input_ids,
                 self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_post.output_all_tokens_hctol",
+                x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
+                input_ids,
+                self.layer_id,
+                tol=_V4_PREFILL_DIAG_HC_TOL,
+            )
+            _v4_prefill_diag_hc_post_token_replay(
+                f"L{self.layer_id}.attn_hc_post",
+                attn_out=attn_out_for_diag,
+                residual=residual_for_diag,
+                post=post_for_diag,
+                comb=comb_for_diag,
+                hc_post_module=self.attn_hc_post,
+                actual=x,
+                input_ids=input_ids,
+                layer_id=self.layer_id,
+                token_idx=_V4_MHC_REPLAY_TOKEN,
             )
 
         # ----- FFN sub-layer with mHC mixing -----
