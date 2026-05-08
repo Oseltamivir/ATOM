@@ -166,6 +166,16 @@ _V4_PREFILL_DIAG_REF_LAYER_SPEC = os.environ.get(
     "ATOM_DSV4_PREFILL_DIAG_REF_LAYERS",
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_DEEP_LAYERS", "0"),
 )
+_V4_PREFILL_DIAG_FIRST_BAD_BOUNDARY_PRINTED = False
+_V4_PREFILL_DIAG_BOUNDARY_SUFFIXES = (
+    ".input_mhc_all_tokens",
+    ".attn_hc_pre.y_all_tokens",
+    ".attn_out_all_tokens",
+    ".attn_hc_post.output_all_tokens",
+    ".ffn_norm_all_tokens",
+    ".ffn_out_all_tokens",
+    ".ffn_hc_post.output_all_tokens",
+)
 
 
 def _v4_torch_tp_all_reduce(
@@ -389,7 +399,7 @@ def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
 
 def _v4_prefill_diag_sequence_rows(
     label: str, seq_rows: torch.Tensor, tol: float
-) -> None:
+) -> Optional[Tuple[int, float, float, int, int]]:
     """Compare full per-request sequences for an identical-prompt prefill batch.
 
     `_v4_prefill_diag_check` intentionally compares only the last token per
@@ -398,15 +408,13 @@ def _v4_prefill_diag_sequence_rows(
     """
     rows_f = seq_rows.detach().float()
     if rows_f.dim() < 2 or rows_f.size(0) < 2:
-        return
+        return None
     bs = rows_f.size(0)
     seqlen = rows_f.size(1)
     diff = (rows_f - rows_f[0:1]).abs()
     token_max = diff.reshape(bs, seqlen, -1).amax(dim=2)
     row_max = token_max.amax(dim=1)
     bad_rows = int((row_max > tol).sum().item())
-    if not _V4_PREFILL_DIAG_VERBOSE and bad_rows == 0:
-        return
     max_abs = float(diff.max().item()) if diff.numel() else 0.0
     mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
     bad = (token_max > tol).nonzero()
@@ -418,6 +426,8 @@ def _v4_prefill_diag_sequence_rows(
         first_bad_row = -1
         first_bad_tok = -1
         bad_tokens_per_row = [0] * bs
+    if not _V4_PREFILL_DIAG_VERBOSE and bad_rows == 0:
+        return bad_rows, max_abs, mean_abs, first_bad_row, first_bad_tok
     print(
         "[DSv4 prefill diag] "
         f"rank={_v4_prefill_diag_rank()} {label}: "
@@ -427,6 +437,11 @@ def _v4_prefill_diag_sequence_rows(
         f"bad_tokens_head={bad_tokens_per_row[:8]}",
         flush=True,
     )
+    return bad_rows, max_abs, mean_abs, first_bad_row, first_bad_tok
+
+
+def _v4_prefill_diag_is_boundary_label(label: str) -> bool:
+    return label.endswith(_V4_PREFILL_DIAG_BOUNDARY_SUFFIXES)
 
 
 def _v4_prefill_diag_check_all_tokens(
@@ -447,9 +462,26 @@ def _v4_prefill_diag_check_all_tokens(
         if view.size(0) != total:
             return
         rows = view.reshape(bs, seqlen, -1)
-        _v4_prefill_diag_sequence_rows(
+        stats = _v4_prefill_diag_sequence_rows(
             label, rows, _V4_PREFILL_DIAG_TOL if tol is None else tol
         )
+        global _V4_PREFILL_DIAG_FIRST_BAD_BOUNDARY_PRINTED
+        if (
+            stats is not None
+            and stats[0] > 0
+            and _v4_prefill_diag_is_boundary_label(label)
+            and not _V4_PREFILL_DIAG_FIRST_BAD_BOUNDARY_PRINTED
+        ):
+            bad_rows, max_abs, mean_abs, first_bad_row, first_bad_tok = stats
+            print(
+                "[DSv4 boundary first_bad] "
+                f"rank={_v4_prefill_diag_rank()} label={label} "
+                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{bs} first_bad_row={first_bad_row} "
+                f"first_bad_tok={first_bad_tok}",
+                flush=True,
+            )
+            _V4_PREFILL_DIAG_FIRST_BAD_BOUNDARY_PRINTED = True
     except Exception as exc:
         print(f"[DSv4 prefill diag] {label}: all-token check failed: {exc!r}", flush=True)
 
@@ -4189,6 +4221,12 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.input_mhc_all_tokens",
+                x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
+                input_ids,
+                self.layer_id,
+            )
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         if layer_diag:
@@ -4215,6 +4253,12 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_hc_pre.y_all_tokens",
+                x,
+                input_ids,
+                self.layer_id,
+            )
         x = self.attn_norm(x)  # [num_tokens, dim]
         if layer_diag:
             _v4_prefill_diag_check(
@@ -4227,6 +4271,12 @@ class Block(nn.Module):
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_out",
+                x,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.attn_out_all_tokens",
                 x,
                 input_ids,
                 self.layer_id,
@@ -4377,6 +4427,12 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn_out_all_tokens",
+                x,
+                input_ids,
+                self.layer_id,
+            )
         x = self.hc_post(
             x,
             residual,
@@ -4389,6 +4445,12 @@ class Block(nn.Module):
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_hc_post",
                 x,
+                input_ids,
+                self.layer_id,
+            )
+            _v4_prefill_diag_check_all_tokens(
+                f"L{self.layer_id}.ffn_hc_post.output_all_tokens",
+                x.reshape(x.shape[0], -1) if x.dim() == 3 else x,
                 input_ids,
                 self.layer_id,
             )
