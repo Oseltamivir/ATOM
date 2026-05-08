@@ -4325,7 +4325,7 @@ class Block(nn.Module):
                 residual=residual_for_diag,
                 post=post_for_diag,
                 comb=comb_for_diag,
-                hc_post_module=self.attn_hc_post,
+                hc_post_module=self.hc_post,
                 actual=x,
                 input_ids=input_ids,
                 layer_id=self.layer_id,
