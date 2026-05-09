@@ -159,6 +159,16 @@ _V4_PREFILL_DIAG_LINEAR_LAYER_SPEC = os.environ.get(
 _V4_PREFILL_DIAG_REPLAY_ROWS = int(
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_REPLAY_ROWS", "16")
 )
+_V4_PREFILL_DIAG_MOE_REPLAY = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_REPLAY", "0") == "1"
+)
+_V4_PREFILL_DIAG_MOE_REPLAY_TOKENS = tuple(
+    int(tok)
+    for tok in os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_REPLAY_TOKENS", "0,44")
+    .replace(":", ",")
+    .split(",")
+    if tok.strip()
+)
 _V4_PREFILL_DIAG_REF_COMPARE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_REF_COMPARE", "1") == "1"
 )
@@ -3665,6 +3675,95 @@ class MoE(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
 
+    def _diag_routed_expert_replay(
+        self,
+        *,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        routed: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+    ) -> None:
+        if not _V4_PREFILL_DIAG_MOE_REPLAY:
+            return
+        batch = _v4_prefill_diag_equal_batch(input_ids)
+        if batch is None:
+            return
+        bs, seqlen, total = batch
+        if x.size(0) < total or routed.size(0) < total:
+            return
+        n = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+        device = x.device
+        saved_hash_input_ids = getattr(self, "_hash_input_ids", None)
+        for token_idx in _V4_PREFILL_DIAG_MOE_REPLAY_TOKENS:
+            if token_idx < 0 or token_idx >= seqlen:
+                continue
+            rows = torch.arange(n, device=device, dtype=torch.long) * seqlen + token_idx
+            x_tok = x.index_select(0, rows).contiguous()
+            logits_tok = router_logits.index_select(0, rows).contiguous()
+            actual_tok = routed.index_select(0, rows).contiguous()
+            ids_tok = (
+                input_ids.index_select(0, rows).contiguous()
+                if input_ids is not None
+                else None
+            )
+            try:
+                if self.is_hash_layer:
+                    self._hash_input_ids = ids_tok
+                replay = self.experts(
+                    hidden_states=x_tok,
+                    router_logits=logits_tok,
+                )
+                if self.is_hash_layer and ids_tok is not None:
+                    self._hash_input_ids = ids_tok[0:1].expand(n).contiguous()
+                replay_same = self.experts(
+                    hidden_states=x_tok[0:1].expand_as(x_tok).contiguous(),
+                    router_logits=logits_tok[0:1]
+                    .expand_as(logits_tok)
+                    .contiguous(),
+                )
+                label = f"L{self.layer_id}.ffn.routed_moe.token{token_idx}"
+                _v4_prefill_diag_rows(
+                    f"{label}.x",
+                    x_tok,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{label}.router_logits",
+                    logits_tok,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{label}.actual",
+                    actual_tok,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{label}.replay",
+                    replay,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{label}.replay_row0_repeated",
+                    replay_same,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_pair_rows(
+                    f"{label}.actual_minus_replay",
+                    actual_tok,
+                    replay,
+                    _V4_PREFILL_DIAG_TOL,
+                )
+            except Exception as exc:
+                print(
+                    "[DSv4 moe diag] "
+                    f"rank={_v4_prefill_diag_rank()} "
+                    f"L{self.layer_id}.ffn.routed_moe.token{token_idx}.replay failed: {exc!r}",
+                    flush=True,
+                )
+            finally:
+                if self.is_hash_layer:
+                    self._hash_input_ids = saved_hash_input_ids
+
     def routed_expert_forward(
         self,
         x: torch.Tensor,  # [num_tokens, dim]
@@ -3749,6 +3848,12 @@ class MoE(nn.Module):
                 routed,
                 input_ids,
                 self.layer_id,
+            )
+            self._diag_routed_expert_replay(
+                x=x,
+                router_logits=router_logits,
+                routed=routed,
+                input_ids=input_ids,
             )
         return routed
 
