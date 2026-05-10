@@ -3746,13 +3746,25 @@ class MoE(nn.Module):
                     logits: torch.Tensor,
                     hash_ids: Optional[torch.Tensor],
                 ) -> torch.Tensor:
-                    if self.is_hash_layer:
-                        self._hash_input_ids = hash_ids
-                    _set_aiter_context(context)
-                    return self.experts(
-                        hidden_states=hidden,
-                        router_logits=logits,
-                    )
+                    old_ctx = None
+                    if aiter_fused_moe is not None:
+                        old_ctx = getattr(
+                            aiter_fused_moe, "_DSV4_MOE_TRACE_CONTEXT", None
+                        )
+                    old_hash_ids = getattr(self, "_hash_input_ids", None)
+                    try:
+                        if self.is_hash_layer:
+                            self._hash_input_ids = hash_ids
+                        _set_aiter_context(context)
+                        return self.experts(
+                            hidden_states=hidden,
+                            router_logits=logits,
+                        )
+                    finally:
+                        if aiter_fused_moe is not None:
+                            aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = old_ctx
+                        if self.is_hash_layer:
+                            self._hash_input_ids = old_hash_ids
 
                 def _row_serial_replay(
                     serial_label: str,
