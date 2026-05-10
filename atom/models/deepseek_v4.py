@@ -169,6 +169,23 @@ _V4_PREFILL_DIAG_MOE_REPLAY_TOKENS = tuple(
     .split(",")
     if tok.strip()
 )
+_V4_PREFILL_DIAG_MOE_REPEAT_MS = tuple(
+    int(rep_m)
+    for rep_m in os.environ.get(
+        "ATOM_DSV4_PREFILL_DIAG_MOE_REPEAT_MS",
+        "",
+    )
+    .replace(":", ",")
+    .split(",")
+    if rep_m.strip()
+)
+_V4_PREFILL_DIAG_MOE_ROW_SERIAL = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_ROW_SERIAL", "0") == "1"
+)
+_V4_PREFILL_DIAG_MOE_ROW_SERIAL_MAX_M = int(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_ROW_SERIAL_MAX_M", "16")
+)
+_V4_PREFILL_DIAG_MOE_REPEAT_SEEN = set()
 _V4_PREFILL_DIAG_REF_COMPARE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_REF_COMPARE", "1") == "1"
 )
@@ -3718,25 +3735,82 @@ class MoE(nn.Module):
                     )
                 except Exception:
                     pass
-                if self.is_hash_layer:
-                    self._hash_input_ids = ids_tok
-                if aiter_fused_moe is not None:
-                    aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = f"{label}.replay"
-                replay = self.experts(
-                    hidden_states=x_tok,
-                    router_logits=logits_tok,
-                )
-                if self.is_hash_layer and ids_tok is not None:
-                    self._hash_input_ids = ids_tok[0:1].expand(n).contiguous()
-                if aiter_fused_moe is not None:
-                    aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = (
-                        f"{label}.replay_row0_repeated"
+
+                def _set_aiter_context(context: str) -> None:
+                    if aiter_fused_moe is not None:
+                        aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = context
+
+                def _run_experts_with_trace(
+                    context: str,
+                    hidden: torch.Tensor,
+                    logits: torch.Tensor,
+                    hash_ids: Optional[torch.Tensor],
+                ) -> torch.Tensor:
+                    if self.is_hash_layer:
+                        self._hash_input_ids = hash_ids
+                    _set_aiter_context(context)
+                    return self.experts(
+                        hidden_states=hidden,
+                        router_logits=logits,
                     )
-                replay_same = self.experts(
-                    hidden_states=x_tok[0:1].expand_as(x_tok).contiguous(),
-                    router_logits=logits_tok[0:1]
-                    .expand_as(logits_tok)
-                    .contiguous(),
+
+                def _row_serial_replay(
+                    serial_label: str,
+                    hidden: torch.Tensor,
+                    logits: torch.Tensor,
+                    hash_ids: Optional[torch.Tensor],
+                    batched_out: torch.Tensor,
+                ) -> None:
+                    if not _V4_PREFILL_DIAG_MOE_ROW_SERIAL:
+                        return
+                    if hidden.size(0) > _V4_PREFILL_DIAG_MOE_ROW_SERIAL_MAX_M:
+                        return
+                    outs = []
+                    for r in range(hidden.size(0)):
+                        hash_row = (
+                            hash_ids[r : r + 1].contiguous()
+                            if hash_ids is not None
+                            else None
+                        )
+                        outs.append(
+                            _run_experts_with_trace(
+                                f"{serial_label}.row_serial",
+                                hidden[r : r + 1].contiguous(),
+                                logits[r : r + 1].contiguous(),
+                                hash_row,
+                            )
+                        )
+                    out_serial = torch.cat(outs, dim=0)
+                    _v4_prefill_diag_rows(
+                        f"{serial_label}.row_serial",
+                        out_serial,
+                        _V4_PREFILL_DIAG_TOL,
+                    )
+                    _v4_prefill_diag_pair_rows(
+                        f"{serial_label}.batched_minus_row_serial",
+                        batched_out,
+                        out_serial,
+                        _V4_PREFILL_DIAG_TOL,
+                    )
+
+                replay = _run_experts_with_trace(
+                    f"{label}.replay",
+                    x_tok,
+                    logits_tok,
+                    ids_tok,
+                )
+                ids_same = (
+                    ids_tok[0:1].expand(n).contiguous()
+                    if ids_tok is not None
+                    else None
+                )
+                x_same = x_tok[0:1].expand_as(x_tok).contiguous()
+                logits_same = logits_tok[0:1].expand_as(logits_tok).contiguous()
+                replay_same = _run_experts_with_trace(
+                    f"{label}.replay_row0_repeated",
+                    x_same,
+                    logits_same,
+                    ids_same,
                 )
                 _v4_prefill_diag_rows(
                     f"{label}.x",
@@ -3769,6 +3843,50 @@ class MoE(nn.Module):
                     replay,
                     _V4_PREFILL_DIAG_TOL,
                 )
+                _row_serial_replay(
+                    f"{label}.replay_row0_repeated",
+                    x_same,
+                    logits_same,
+                    ids_same,
+                    replay_same,
+                )
+                repeat_key = (self.layer_id, token_idx, seqlen, x_tok.size(1))
+                if (
+                    _V4_PREFILL_DIAG_MOE_REPEAT_MS
+                    and repeat_key not in _V4_PREFILL_DIAG_MOE_REPEAT_SEEN
+                ):
+                    _V4_PREFILL_DIAG_MOE_REPEAT_SEEN.add(repeat_key)
+                    for rep_m in _V4_PREFILL_DIAG_MOE_REPEAT_MS:
+                        if rep_m <= 0:
+                            continue
+                        repeat_label = f"{label}.repeatM{rep_m}"
+                        x_rep = x_tok[0:1].expand(rep_m, -1).contiguous()
+                        logits_rep = (
+                            logits_tok[0:1].expand(rep_m, -1).contiguous()
+                        )
+                        ids_rep = (
+                            ids_tok[0:1].expand(rep_m).contiguous()
+                            if ids_tok is not None
+                            else None
+                        )
+                        out_rep = _run_experts_with_trace(
+                            repeat_label,
+                            x_rep,
+                            logits_rep,
+                            ids_rep,
+                        )
+                        _v4_prefill_diag_rows(
+                            repeat_label,
+                            out_rep,
+                            _V4_PREFILL_DIAG_TOL,
+                        )
+                        _row_serial_replay(
+                            repeat_label,
+                            x_rep,
+                            logits_rep,
+                            ids_rep,
+                            out_rep,
+                        )
             except Exception as exc:
                 print(
                     "[DSv4 moe diag] "
