@@ -3706,22 +3706,38 @@ class MoE(nn.Module):
                 if input_ids is not None
                 else None
             )
+            label = f"L{self.layer_id}.ffn.routed_moe.token{token_idx}"
+            aiter_fused_moe = None
+            old_aiter_ctx = None
             try:
+                try:
+                    import aiter.fused_moe as aiter_fused_moe
+
+                    old_aiter_ctx = getattr(
+                        aiter_fused_moe, "_DSV4_MOE_TRACE_CONTEXT", None
+                    )
+                except Exception:
+                    pass
                 if self.is_hash_layer:
                     self._hash_input_ids = ids_tok
+                if aiter_fused_moe is not None:
+                    aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = f"{label}.replay"
                 replay = self.experts(
                     hidden_states=x_tok,
                     router_logits=logits_tok,
                 )
                 if self.is_hash_layer and ids_tok is not None:
                     self._hash_input_ids = ids_tok[0:1].expand(n).contiguous()
+                if aiter_fused_moe is not None:
+                    aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = (
+                        f"{label}.replay_row0_repeated"
+                    )
                 replay_same = self.experts(
                     hidden_states=x_tok[0:1].expand_as(x_tok).contiguous(),
                     router_logits=logits_tok[0:1]
                     .expand_as(logits_tok)
                     .contiguous(),
                 )
-                label = f"L{self.layer_id}.ffn.routed_moe.token{token_idx}"
                 _v4_prefill_diag_rows(
                     f"{label}.x",
                     x_tok,
@@ -3761,6 +3777,8 @@ class MoE(nn.Module):
                     flush=True,
                 )
             finally:
+                if aiter_fused_moe is not None:
+                    aiter_fused_moe._DSV4_MOE_TRACE_CONTEXT = old_aiter_ctx
                 if self.is_hash_layer:
                     self._hash_input_ids = saved_hash_input_ids
 
