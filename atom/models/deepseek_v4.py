@@ -159,6 +159,19 @@ _V4_PREFILL_DIAG_LINEAR_LAYER_SPEC = os.environ.get(
 _V4_PREFILL_DIAG_REPLAY_ROWS = int(
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_REPLAY_ROWS", "16")
 )
+_V4_PREFILL_DIAG_PROD_SCAN = (
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_PROD_SCAN", "0") == "1"
+)
+_V4_PREFILL_DIAG_PROD_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_PREFILL_DIAG_PROD_LAYERS", "all"
+)
+_V4_PREFILL_DIAG_TOKENS = tuple(
+    int(tok)
+    for tok in os.environ.get("ATOM_DSV4_PREFILL_DIAG_TOKENS", "0,44,-1")
+    .replace(":", ",")
+    .split(",")
+    if tok.strip()
+)
 _V4_PREFILL_DIAG_MOE_REPLAY = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_REPLAY", "0") == "1"
 )
@@ -186,6 +199,10 @@ _V4_PREFILL_DIAG_MOE_ROW_SERIAL_MAX_M = int(
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_ROW_SERIAL_MAX_M", "16")
 )
 _V4_PREFILL_DIAG_MOE_REPEAT_SEEN = set()
+_V4_PREFILL_DIAG_MOE_FORCE_M = int(
+    os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_FORCE_M", "0")
+)
+_V4_PREFILL_DIAG_MOE_FORCE_SEEN = set()
 _V4_PREFILL_DIAG_REF_COMPARE = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_REF_COMPARE", "1") == "1"
 )
@@ -203,6 +220,7 @@ _V4_PREFILL_DIAG_BOUNDARY_SUFFIXES = (
     ".ffn_out_all_tokens",
     ".ffn_hc_post.output_all_tokens",
 )
+_V4_PROD_FIRST_BAD = set()
 
 
 def _v4_torch_tp_all_reduce(
@@ -381,6 +399,24 @@ def _v4_prefill_diag_equal_batch(input_ids: Optional[torch.Tensor]):
         return None
 
 
+def _v4_resolve_diag_token(token_idx: int, seqlen: int) -> Optional[int]:
+    if token_idx < 0:
+        token_idx = seqlen + token_idx
+    if token_idx < 0 or token_idx >= seqlen:
+        return None
+    return token_idx
+
+
+def _v4_prefill_diag_prod_scan_active(
+    input_ids: Optional[torch.Tensor], layer_id: Optional[int]
+) -> bool:
+    if not _V4_PREFILL_DIAG or not _V4_PREFILL_DIAG_PROD_SCAN:
+        return False
+    if not _v4_prefill_diag_layer_in_spec(layer_id, _V4_PREFILL_DIAG_PROD_LAYER_SPEC):
+        return False
+    return input_ids is not None
+
+
 def _v4_prefill_diag_select_rows(
     tensor: torch.Tensor,
     input_ids: Optional[torch.Tensor],
@@ -397,7 +433,9 @@ def _v4_prefill_diag_select_rows(
     return None
 
 
-def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
+def _v4_prefill_diag_rows_stats(
+    rows: torch.Tensor, tol: float
+) -> tuple[float, float, int, int]:
     rows_f = rows.detach().float()
     ref = rows_f[0:1]
     diff = (rows_f - ref).abs()
@@ -407,6 +445,14 @@ def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
     mean_abs = float(diff.mean().item()) if diff.numel() else 0.0
     bad = (row_max > tol).nonzero()
     first_bad = int(bad[0].item()) if bad.numel() else -1
+    return max_abs, mean_abs, bad_rows, first_bad
+
+
+def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
+    rows_f = rows.detach().float()
+    max_abs, mean_abs, bad_rows, first_bad = _v4_prefill_diag_rows_stats(
+        rows, tol
+    )
     extra = ""
     if rows_f.dim() >= 2 and rows_f.reshape(rows_f.size(0), -1).size(1) > 1:
         flat = rows_f.reshape(rows_f.size(0), -1)
@@ -422,6 +468,63 @@ def _v4_prefill_diag_rows(label: str, rows: torch.Tensor, tol: float) -> None:
         f"bad_rows={bad_rows}/{rows.size(0)} first_bad={first_bad}{extra}",
         flush=True,
     )
+
+
+def _v4_prefill_diag_actual_token_scan(
+    label: str,
+    tensor: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    layer_id: Optional[int],
+) -> None:
+    if tensor is None or not _v4_prefill_diag_prod_scan_active(input_ids, layer_id):
+        return
+    batch = _v4_prefill_diag_equal_batch(input_ids)
+    if batch is None:
+        return
+    bs, seqlen, total = batch
+    view = tensor.detach()
+    if view.size(0) != total:
+        return
+    flat = view.reshape(total, -1)
+    rows_per_token = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+    for requested_tok in _V4_PREFILL_DIAG_TOKENS:
+        tok = _v4_resolve_diag_token(requested_tok, seqlen)
+        if tok is None:
+            continue
+        key = (layer_id, tok)
+        if key in _V4_PROD_FIRST_BAD and not _V4_PREFILL_DIAG_VERBOSE:
+            continue
+        row_idx = (
+            torch.arange(rows_per_token, device=flat.device, dtype=torch.long)
+            * seqlen
+            + tok
+        )
+        rows = flat.index_select(0, row_idx).contiguous()
+        max_abs, mean_abs, bad_rows, first_bad = _v4_prefill_diag_rows_stats(
+            rows, _V4_PREFILL_DIAG_TOL
+        )
+        if bad_rows == 0 and not _V4_PREFILL_DIAG_VERBOSE:
+            continue
+        if bad_rows == 0 or key not in _V4_PROD_FIRST_BAD or _V4_PREFILL_DIAG_VERBOSE:
+            prefix = f"L{layer_id}." if layer_id is not None else ""
+            print(
+                "[DSv4 prod scan] "
+                f"rank={_v4_prefill_diag_rank()} "
+                f"{prefix}{label}.tok{tok}: shape={tuple(rows.shape)} "
+                f"max_abs={max_abs:.6g} mean_abs={mean_abs:.6g} "
+                f"bad_rows={bad_rows}/{rows.size(0)} first_bad={first_bad}",
+                flush=True,
+            )
+        if bad_rows and key not in _V4_PROD_FIRST_BAD:
+            _V4_PROD_FIRST_BAD.add(key)
+            prefix = f"L{layer_id}." if layer_id is not None else ""
+            print(
+                "[DSv4 prod first-bad candidate] "
+                f"rank={_v4_prefill_diag_rank()} "
+                f"{prefix}{label}.tok{tok} "
+                f"max_abs={max_abs:.9g} bad_rows={bad_rows}/{rows.size(0)}",
+                flush=True,
+            )
 
 
 def _v4_prefill_diag_sequence_rows(
@@ -3711,8 +3814,9 @@ class MoE(nn.Module):
         n = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
         device = x.device
         saved_hash_input_ids = getattr(self, "_hash_input_ids", None)
-        for token_idx in _V4_PREFILL_DIAG_MOE_REPLAY_TOKENS:
-            if token_idx < 0 or token_idx >= seqlen:
+        for requested_token_idx in _V4_PREFILL_DIAG_MOE_REPLAY_TOKENS:
+            token_idx = _v4_resolve_diag_token(requested_token_idx, seqlen)
+            if token_idx is None:
                 continue
             rows = torch.arange(n, device=device, dtype=torch.long) * seqlen + token_idx
             x_tok = x.index_select(0, rows).contiguous()
@@ -3899,6 +4003,38 @@ class MoE(nn.Module):
                             ids_rep,
                             out_rep,
                         )
+                force_key = (
+                    self.layer_id,
+                    token_idx,
+                    seqlen,
+                    x_tok.size(1),
+                    _V4_PREFILL_DIAG_MOE_FORCE_M,
+                )
+                if (
+                    _V4_PREFILL_DIAG_MOE_FORCE_M > 0
+                    and force_key not in _V4_PREFILL_DIAG_MOE_FORCE_SEEN
+                ):
+                    _V4_PREFILL_DIAG_MOE_FORCE_SEEN.add(force_key)
+                    force_m = _V4_PREFILL_DIAG_MOE_FORCE_M
+                    force_label = f"{label}.forceM{force_m}"
+                    x_force = x_tok[0:1].expand(force_m, -1).contiguous()
+                    logits_force = logits_tok[0:1].expand(force_m, -1).contiguous()
+                    ids_force = (
+                        ids_tok[0:1].expand(force_m).contiguous()
+                        if ids_tok is not None
+                        else None
+                    )
+                    out_force = _run_experts_with_trace(
+                        force_label,
+                        x_force,
+                        logits_force,
+                        ids_force,
+                    )
+                    _v4_prefill_diag_rows(
+                        force_label,
+                        out_force[: min(force_m, _V4_PREFILL_DIAG_REPLAY_ROWS)],
+                        _V4_PREFILL_DIAG_TOL,
+                    )
             except Exception as exc:
                 print(
                     "[DSv4 moe diag] "
@@ -3925,6 +4061,18 @@ class MoE(nn.Module):
         can read it.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        _v4_prefill_diag_actual_token_scan(
+            "ffn.routed_moe.input",
+            x,
+            input_ids,
+            self.layer_id,
+        )
+        _v4_prefill_diag_actual_token_scan(
+            "ffn.routed_moe.router_logits",
+            router_logits,
+            input_ids,
+            self.layer_id,
+        )
         diag_enabled = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
         if diag_enabled:
             _v4_prefill_diag_check(
@@ -3984,6 +4132,12 @@ class MoE(nn.Module):
                     flush=True,
                 )
         routed = self.experts(hidden_states=x, router_logits=router_logits)
+        _v4_prefill_diag_actual_token_scan(
+            "ffn.routed_moe.actual",
+            routed,
+            input_ids,
+            self.layer_id,
+        )
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.routed_local",
@@ -4015,6 +4169,19 @@ class MoE(nn.Module):
         all-reduce across TP ranks.
         """
         diag_enabled = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
+        _v4_prefill_diag_actual_token_scan(
+            "ffn.routed_pre_combine",
+            routed,
+            input_ids,
+            self.layer_id,
+        )
+        if shared is not None:
+            _v4_prefill_diag_actual_token_scan(
+                "ffn.shared_local",
+                shared,
+                input_ids,
+                self.layer_id,
+            )
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.routed_pre_combine",
@@ -4043,6 +4210,12 @@ class MoE(nn.Module):
                 )
         if shared is not None:
             routed = routed + shared
+            _v4_prefill_diag_actual_token_scan(
+                "ffn.routed_plus_shared",
+                routed,
+                input_ids,
+                self.layer_id,
+            )
             if diag_enabled:
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.routed_plus_shared",
@@ -4061,6 +4234,18 @@ class MoE(nn.Module):
             if diag_enabled:
                 torch_reduced = _v4_torch_tp_all_reduce(routed)
                 aiter_reduced = _v4_aiter_tp_all_reduce(routed)
+                _v4_prefill_diag_actual_token_scan(
+                    "ffn.torch_reduce",
+                    torch_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
+                _v4_prefill_diag_actual_token_scan(
+                    "ffn.aiter_reduce",
+                    aiter_reduced,
+                    input_ids,
+                    self.layer_id,
+                )
                 _v4_prefill_diag_check(
                     f"L{self.layer_id}.ffn.torch_reduce",
                     torch_reduced,
@@ -4097,6 +4282,12 @@ class MoE(nn.Module):
                 routed = _v4_torch_tp_all_reduce(routed)
             else:
                 routed = _v4_aiter_tp_all_reduce(routed)
+        _v4_prefill_diag_actual_token_scan(
+            "ffn.combined_result",
+            routed,
+            input_ids,
+            self.layer_id,
+        )
         if diag_enabled:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn.combined_result",
@@ -4564,6 +4755,12 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+        _v4_prefill_diag_actual_token_scan(
+            "input_mhc",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         # ----- Attention sub-layer with mHC mixing -----
         residual = x  # [num_tokens, hc, dim]
         if layer_diag:
@@ -4596,7 +4793,19 @@ class Block(nn.Module):
                 input_ids,
                 self.layer_id,
             )
+        _v4_prefill_diag_actual_token_scan(
+            "attn_hc_pre.y",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         x = self.attn_norm(x)  # [num_tokens, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "attn_norm",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_norm",
@@ -4605,6 +4814,12 @@ class Block(nn.Module):
                 self.layer_id,
             )
         x = self.attn(x, positions, input_ids=input_ids)  # [num_tokens, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "attn_out",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_out",
@@ -4686,6 +4901,12 @@ class Block(nn.Module):
             diag_label=f"L{self.layer_id}.attn_hc_post",
             input_ids=input_ids,
         )  # [num_tokens, hc, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "attn_hc_post.output",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.attn_hc_post",
@@ -4729,6 +4950,12 @@ class Block(nn.Module):
             diag_label=f"L{self.layer_id}.ffn_hc_pre",
             input_ids=input_ids,
         )
+        _v4_prefill_diag_actual_token_scan(
+            "ffn_hc_pre",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_hc_pre",
@@ -4743,6 +4970,12 @@ class Block(nn.Module):
                 self.layer_id,
             )
         x = self.ffn_norm(x)  # [num_tokens, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "ffn_norm",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_norm",
@@ -4757,6 +4990,12 @@ class Block(nn.Module):
                 self.layer_id,
             )
         x = self.ffn(x, input_ids)  # [num_tokens, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "ffn_out",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_out",
@@ -4778,6 +5017,12 @@ class Block(nn.Module):
             diag_label=f"L{self.layer_id}.ffn_hc_post",
             input_ids=input_ids,
         )  # [num_tokens, hc, dim]
+        _v4_prefill_diag_actual_token_scan(
+            "post_ffn_residual",
+            x,
+            input_ids,
+            self.layer_id,
+        )
         if layer_diag:
             _v4_prefill_diag_check(
                 f"L{self.layer_id}.ffn_hc_post",
@@ -5052,9 +5297,11 @@ class DeepseekV4Model(nn.Module):
         assert input_ids.dim() == 1, f"input_ids must be 1D, got {input_ids.shape}"
         h = self.embed(input_ids)  # [num_tokens, dim]
         _v4_prefill_diag_check("model.embed", h, input_ids)
+        _v4_prefill_diag_actual_token_scan("model.embed", h, input_ids, None)
         # Expand to hc_mult copies for Hyper-Connections: [num_tokens, hc, dim]
         h = h.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         _v4_prefill_diag_check("model.embed_mhc", h, input_ids)
+        _v4_prefill_diag_actual_token_scan("model.embed_mhc", h, input_ids, None)
         if positions is None:
             positions = torch.arange(
                 input_ids.numel(), device=input_ids.device, dtype=torch.long
@@ -5074,8 +5321,10 @@ class DeepseekV4Model(nn.Module):
             input_ids=input_ids,
         )
         _v4_prefill_diag_check("model.hc_head", x_hc, input_ids)
+        _v4_prefill_diag_actual_token_scan("model.hc_head", x_hc, input_ids, None)
         out = self.norm(x_hc)
         _v4_prefill_diag_check("model.final_norm", out, input_ids)
+        _v4_prefill_diag_actual_token_scan("model.final_norm", out, input_ids, None)
         return out
 
 
