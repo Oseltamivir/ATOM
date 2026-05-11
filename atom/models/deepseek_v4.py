@@ -172,6 +172,21 @@ _V4_PREFILL_DIAG_TOKENS = tuple(
     .split(",")
     if tok.strip()
 )
+_V4_ROUTER_GATE_TORCH = os.environ.get("ATOM_DSV4_ROUTER_GATE_TORCH", "0") == "1"
+_V4_ROUTER_GATE_DIAG = os.environ.get("ATOM_DSV4_ROUTER_GATE_DIAG", "0") == "1"
+_V4_ROUTER_GATE_DIAG_LAYER_SPEC = os.environ.get(
+    "ATOM_DSV4_ROUTER_GATE_DIAG_LAYERS", "0"
+)
+_V4_ROUTER_GATE_DIAG_TOKENS = tuple(
+    int(tok)
+    for tok in os.environ.get("ATOM_DSV4_ROUTER_GATE_DIAG_TOKENS", "0,44,-1")
+    .replace(":", ",")
+    .split(",")
+    if tok.strip()
+)
+_V4_ROUTER_GATE_FORCE_M = int(
+    os.environ.get("ATOM_DSV4_ROUTER_GATE_FORCE_M", "8192")
+)
 _V4_PREFILL_DIAG_MOE_REPLAY = (
     os.environ.get("ATOM_DSV4_PREFILL_DIAG_MOE_REPLAY", "0") == "1"
 )
@@ -3795,6 +3810,138 @@ class MoE(nn.Module):
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights, topk_ids
 
+    def _router_gate_torch(
+        self,
+        x: torch.Tensor,
+        *,
+        out_dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        weight = self.gate.weight
+        bias = getattr(self.gate, "bias", None)
+        y = F.linear(
+            x.float(),
+            weight.float(),
+            None if bias is None else bias.float(),
+        )
+        return y.to(out_dtype if out_dtype is not None else x.dtype)
+
+    def _router_gate_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _V4_ROUTER_GATE_TORCH:
+            return self._router_gate_torch(x, out_dtype=x.dtype)
+        return self.gate(x)
+
+    def _diag_router_gate(
+        self,
+        *,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
+    ) -> None:
+        if not (
+            _V4_PREFILL_DIAG
+            and _V4_ROUTER_GATE_DIAG
+            and _v4_prefill_diag_layer_in_spec(
+                self.layer_id, _V4_ROUTER_GATE_DIAG_LAYER_SPEC
+            )
+        ):
+            return
+        batch = _v4_prefill_diag_equal_batch(input_ids)
+        if batch is None:
+            return
+        bs, seqlen, total = batch
+        if x.size(0) < total or router_logits.size(0) < total:
+            return
+        n = min(bs, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+        device = x.device
+        for requested_token_idx in _V4_ROUTER_GATE_DIAG_TOKENS:
+            token_idx = _v4_resolve_diag_token(requested_token_idx, seqlen)
+            if token_idx is None:
+                continue
+            rows = (
+                torch.arange(n, device=device, dtype=torch.long) * seqlen
+                + token_idx
+            )
+            x_tok = x.index_select(0, rows).contiguous()
+            actual_tok = router_logits.index_select(0, rows).contiguous()
+            torch_tok = self._router_gate_torch(
+                x_tok,
+                out_dtype=actual_tok.dtype,
+            )
+            replay_tok = self.gate(x_tok)
+            x_same = x_tok[0:1].expand_as(x_tok).contiguous()
+            replay_same = self.gate(x_same)
+            torch_same = self._router_gate_torch(
+                x_same,
+                out_dtype=actual_tok.dtype,
+            )
+            label = f"L{self.layer_id}.ffn.router_gate.token{token_idx}"
+            actual_name = (
+                "actual_torch_fallback"
+                if _V4_ROUTER_GATE_TORCH
+                else "actual_tgemm"
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.x",
+                x_tok,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.{actual_name}",
+                actual_tok,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.torch_ref",
+                torch_tok,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_pair_rows(
+                f"{label}.{actual_name}_minus_torch_ref",
+                actual_tok,
+                torch_tok,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.replay_tgemm",
+                replay_tok,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.replay_row0_repeated_tgemm",
+                replay_same,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            _v4_prefill_diag_rows(
+                f"{label}.replay_row0_repeated_torch",
+                torch_same,
+                _V4_PREFILL_DIAG_TOL,
+            )
+            if _V4_ROUTER_GATE_FORCE_M > 0:
+                force_m = _V4_ROUTER_GATE_FORCE_M
+                x_force = x_tok[0:1].expand(force_m, -1).contiguous()
+                force_tgemm = self.gate(x_force)
+                force_torch = self._router_gate_torch(
+                    x_force,
+                    out_dtype=force_tgemm.dtype,
+                )
+                force_rows = min(force_m, max(2, _V4_PREFILL_DIAG_REPLAY_ROWS))
+                _v4_prefill_diag_rows(
+                    f"{label}.forceM{force_m}.tgemm",
+                    force_tgemm[:force_rows].contiguous(),
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_rows(
+                    f"{label}.forceM{force_m}.torch",
+                    force_torch[:force_rows].contiguous(),
+                    _V4_PREFILL_DIAG_TOL,
+                )
+                _v4_prefill_diag_pair_rows(
+                    f"{label}.forceM{force_m}.tgemm_minus_torch",
+                    force_tgemm[:force_rows].contiguous(),
+                    force_torch[:force_rows].contiguous(),
+                    _V4_PREFILL_DIAG_TOL,
+                )
+
     def _diag_routed_expert_replay(
         self,
         *,
@@ -4060,7 +4207,7 @@ class MoE(nn.Module):
         here so `_hash_topk` (FusedMoE's custom_routing_function callback)
         can read it.
         """
-        router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        router_logits = self._router_gate_forward(x)  # [num_tokens, n_routed_experts]
         _v4_prefill_diag_actual_token_scan(
             "ffn.routed_moe.input",
             x,
@@ -4073,6 +4220,19 @@ class MoE(nn.Module):
             input_ids,
             self.layer_id,
         )
+        try:
+            self._diag_router_gate(
+                x=x,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+        except Exception as exc:
+            print(
+                "[DSv4 router gate diag] "
+                f"rank={_v4_prefill_diag_rank()} "
+                f"L{self.layer_id}.ffn.router_gate failed: {exc!r}",
+                flush=True,
+            )
         diag_enabled = _v4_prefill_diag_ref_active(input_ids, self.layer_id)
         if diag_enabled:
             _v4_prefill_diag_check(
